@@ -1146,9 +1146,12 @@ static void ReconstructTables(
             filter_section.push_back(tbl[t]);
 
         bool has_filter = !filter_section.empty();
-        /* Also consider byte[4] (initial filter control): non-zero means filter is used */
-        uint8_t initial_ctrl = si.params.arpchord_speed; /* byte[4] per our layout analysis */
-        if (!has_filter && initial_ctrl != 0) has_filter = true;
+        /* initial_ctrl (params byte[4]) is the SID filter register initial value.
+         * It is stored in ALL instruments as part of SID-Wizard's internal state,
+         * even those with no filter table. We must NOT use it alone as evidence of
+         * a filter: only a non-empty filter_section means this instrument actually
+         * drives the SID filter. */
+        uint8_t initial_ctrl = si.params.arpchord_speed; /* byte[4] */
 
         if (has_filter) {
             uint8_t vmask = (i < voice_assignments.size()) ? voice_assignments[i] : 0x07;
@@ -1435,16 +1438,18 @@ void Convert(const SWMFile& swm, GT2File& gt) {
      * If so, duplicate it: one GT2 instrument per voice, each with its voice mask.
      * We also need to patch all pattern references to point to the duplicate. */
     auto instr_has_filter = [&](int sw_idx) -> bool {
-        /* sw_idx is 0-based */
+        /* sw_idx is 0-based.  An instrument has a filter only when its combined
+         * table section contains actual filter bytes — i.e. when filter_offset
+         * is strictly less than the table size (excluding the size marker byte).
+         * We do NOT check initial_ctrl (byte[4]) here because that field is
+         * present in all instruments and does not indicate a filter table. */
         const SW_Instrument& si = swm.instruments[sw_idx];
         const auto& tbl = si.tables;
         uint8_t filter_offset =
             (si.params.filtertb_index >= SW1_INSTRUMENT_PARAMSIZE)
             ? si.params.filtertb_index - SW1_INSTRUMENT_PARAMSIZE
             : (uint8_t)tbl.size();
-        bool has_tbl = (filter_offset < (uint8_t)(tbl.size() - 1));
-        bool has_ctrl = (si.params.arpchord_speed != 0); /* byte[4] */
-        return has_tbl || has_ctrl;
+        return filter_offset < (uint8_t)(tbl.size() - 1);
     };
 
     /* Map: (sw_instr_1based, voice_bit) -> new GT2 instrument index (0-based) */
