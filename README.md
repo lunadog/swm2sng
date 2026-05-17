@@ -1,5 +1,7 @@
 This builds on sng2swm code released by Hermit - Mihaly Horvath and Conrad/Samar as part of Sid Wizard - https://csdb.dk/release/?id=261127
 
+It uses sng.h and swm.h that were already released as part of Sid Wizard.
+
 It attempts to generate working Goattracker files from Sid-Wizard files.
 
 Build instructions: g++ -std=c++17 -O2 -s swm2sng.cpp -o swm2sng
