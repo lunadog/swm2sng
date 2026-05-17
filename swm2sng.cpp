@@ -664,9 +664,11 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
                            SpeedTableBuilder& spdBuilder,
                            uint8_t tempo_cmd   = 0,
                            uint8_t tempo_param = 0,
-                           const std::vector<std::array<uint8_t,3>>* chords    = nullptr,
-                           std::map<std::pair<int,int>,int>*          arp_cache = nullptr,
-                           GT2File*                                   gt_file   = nullptr) {
+                           const std::vector<std::array<uint8_t,3>>* chords      = nullptr,
+                           std::map<std::pair<int,int>,int>*          arp_cache   = nullptr,
+                           GT2File*                                   gt_file     = nullptr,
+                           const std::vector<int8_t>*                 oct_shifts  = nullptr,
+                           uint8_t*                                   inout_instr = nullptr) {
     auto unpacked = UnpackPattern(sw.packed);
 
     gt.rows = sw.length + 1;  /* +1 for GT2's mandatory $FF end row */
@@ -678,13 +680,29 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
 
     /* Dpitch tracks the last real note played; used for slide speed conversion.
      * Initialise to the middle of the SID-Wizard note range (same as sng2swm). */
-    uint8_t Dpitch = (uint8_t)(SW1_NOTE_MAX / 2);
+    uint8_t Dpitch    = (uint8_t)(SW1_NOTE_MAX / 2);
+
+    /* cur_instr: the SW instrument number (1-based) currently active on this
+     * channel.  Initialised from inout_instr so it carries over across pattern
+     * boundaries (GT2 instruments persist until explicitly changed, just as in
+     * SID-Wizard).  Written back to inout_instr at the end of the pattern. */
+    uint8_t cur_instr = (inout_instr && *inout_instr) ? *inout_instr : 0;
 
     while (idx < unpacked.size() && row < gt.rows - 1) {
         sng_pattern_row& r = gt.data[row];
         uint8_t note    = unpacked[idx++];
         bool    hasInstr = (note & 0x80) != 0;
         uint8_t noteVal  = note & 0x7F;
+
+        /* If this row sets an instrument, peek at it NOW — before mapping the note —
+         * so that the octave shift for the new instrument applies to the note on
+         * this very row (not just the following rows). */
+        if (hasInstr && idx < unpacked.size()) {
+            uint8_t peek_instr = unpacked[idx] & 0x7F;
+            if (peek_instr >= SW1_INSTRUMENT_MIN &&
+                peek_instr <= SW1_INSTRUMENT_MAX)
+                cur_instr = peek_instr;
+        }
 
         /* Map SW note value -> GT2 note value.
          *
@@ -705,7 +723,25 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
             break;
         } else if (noteVal >= SW1_PTNCOL1_NOTE &&
                    noteVal <= SW1_NOTE_MAX) {
-            r.note = noteVal + (GT2_PATTERN_NOTE - SW1_PTNCOL1_NOTE);
+            /* Apply per-instrument octave shift (signed semitone offset stored
+             * in params.octave_shift).  In SID-Wizard the player adds this shift
+             * to the note's SID frequency; in GT2 we bake it into the note value. */
+            int shift = 0;
+            if (oct_shifts && cur_instr >= 1 &&
+                (size_t)cur_instr < oct_shifts->size())
+                shift = (*oct_shifts)[cur_instr];
+
+            int gt2_note = (int)noteVal
+                           + (int)(GT2_PATTERN_NOTE - SW1_PTNCOL1_NOTE)
+                           + shift;
+
+            /* Clamp to valid GT2 note range (96 notes: GT2_PATTERN_NOTE to +95) */
+            if (gt2_note < (int)GT2_PATTERN_NOTE)
+                gt2_note = (int)GT2_PATTERN_NOTE;
+            else if (gt2_note > (int)GT2_PATTERN_NOTE + 95)
+                gt2_note = (int)GT2_PATTERN_NOTE + 95;
+
+            r.note = (uint8_t)gt2_note;
             Dpitch = noteVal;
         } else {
             r.note = GT2_PATTERN_REST;
@@ -736,6 +772,7 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
         } else if (instrVal >= SW1_INSTRUMENT_MIN &&
                    instrVal <= SW1_INSTRUMENT_MAX) {
             r.instrument = instrVal;
+            cur_instr    = instrVal;  /* update active instrument for shift lookup */
         }
 
         if (!hasFX) { row++; continue; }
@@ -851,6 +888,9 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
         }
         row++;
     }
+
+    /* Persist the active instrument so the next pattern on this voice inherits it. */
+    if (inout_instr) *inout_instr = cur_instr;
 
     /* GT2 end-of-pattern marker */
     gt.data[gt.rows - 1].note       = GT2_PATTERN_END;
@@ -1528,15 +1568,95 @@ void Convert(const SWMFile& swm, GT2File& gt) {
         }
     }
 
+    /* Per-instrument octave shifts.
+     * SID-Wizard stores a signed semitone offset in params.octave_shift (byte[9]).
+     * GT2 has no equivalent; we bake the shift directly into each note value.
+     * oct_shifts[sw_instr_1based] = shift in semitones (int8_t). */
+    std::vector<int8_t> oct_shifts(swm.header.instrument_count + 1, 0);
+    for (int i = 0; i < swm.header.instrument_count; i++) {
+        int8_t shift = (int8_t)swm.instruments[i].params.octave_shift;
+        oct_shifts[i + 1] = shift;  /* SW instruments are 1-based */
+        if (shift != 0)
+            printf("  Instrument %d: octave_shift=%d semitones (%+d octave%s)\n",
+                   i + 1, (int)shift, (int)(shift / 12),
+                   std::abs(shift / 12) == 1 ? "" : "s");
+    }
+
     /* Patterns (SWM numbering starts at 1, GT2 from 0) */
     gt.patterns.resize(swm.header.pattern_count);
     std::map<std::pair<int,int>,int> arp_cache;
+
+    /* Per-voice active instrument state, carried across pattern boundaries.
+     * Indexed [subtune * 3 + voice].  Each entry is the SW instrument number
+     * (1-based) most recently set on that voice, or 0 if none yet. */
+    std::vector<uint8_t> voice_cur_instr(subtunes * 3, 0);
+
+    /* Build a map from GT2 pattern index → which (subtune, voice) plays it first,
+     * so we can pass the correct inout_instr pointer to ConvertPattern.
+     * A pattern may be played by multiple voices; we thread the state from the
+     * orderlist perspective (voice 0 of subtune 0 → voice 1 → voice 2, etc.). */
+
+    /* Simple approach: convert patterns in orderlist play order per voice so the
+     * instrument state is threaded correctly.  We still convert each pattern once;
+     * if a pattern is shared between voices the last writer wins (acceptable since
+     * the octave shift is an instrument property, not a pattern property). */
+    std::vector<bool> ptn_converted(swm.header.pattern_count, false);
+
+    /* First pass: convert patterns in orderlist order, threading instrument state. */
+    for (int si = 0; si < subtunes; si++) {
+        for (int v = 0; v < 3; v++) {
+            const sng_orderlist& ol = gt.orderlists[si].voice[v];
+            uint8_t* vinstr = &voice_cur_instr[si * 3 + v];
+            for (int e = 0; e < ol.length; e++) {
+                uint8_t entry = ol.data[e];
+                if (entry == SW1_SEQUENCE_LOOPSONG) break;
+                if (entry >= GT2_ORDERLIST_TRANS_MIN) continue; /* transpose */
+                int ptn_idx = (int)entry; /* 0-based GT2 pattern index */
+                if (ptn_idx < 0 || ptn_idx >= swm.header.pattern_count) continue;
+                if (!ptn_converted[ptn_idx]) {
+                    auto [tcmd, tparam] = ptnTempoInject[ptn_idx];
+                    ConvertPattern(swm.patterns[ptn_idx + 1], gt.patterns[ptn_idx],
+                                   spdBuilder, tcmd, tparam,
+                                   swm.chords.empty() ? nullptr : &swm.chords,
+                                   &arp_cache, &gt, &oct_shifts, vinstr);
+                    ptn_converted[ptn_idx] = true;
+                } else {
+                    /* Pattern already converted; still thread the instrument state
+                     * by simulating a scan of its rows to find the last instrument set. */
+                    auto unpacked = UnpackPattern(swm.patterns[ptn_idx + 1].packed);
+                    size_t idx2 = 0;
+                    while (idx2 < unpacked.size()) {
+                        uint8_t nb = unpacked[idx2++];
+                        if (nb & 0x80) {
+                            if (idx2 < unpacked.size()) {
+                                uint8_t ib = unpacked[idx2++];
+                                uint8_t iv = ib & 0x7F;
+                                if (iv >= SW1_INSTRUMENT_MIN && iv <= SW1_INSTRUMENT_MAX)
+                                    *vinstr = iv;
+                                if (ib & 0x80) {
+                                    if (idx2 < unpacked.size()) {
+                                        uint8_t fx = unpacked[idx2++];
+                                        if (fx > 0 && fx < SW1_SMALLFX_MIN && idx2 < unpacked.size())
+                                            idx2++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Convert any patterns not reached by the orderlists (e.g. unused patterns). */
     for (int i = 0; i < swm.header.pattern_count; i++) {
-        auto [tcmd, tparam] = ptnTempoInject[i];
-        ConvertPattern(swm.patterns[i + 1], gt.patterns[i],
-                       spdBuilder, tcmd, tparam,
-                       swm.chords.empty() ? nullptr : &swm.chords,
-                       &arp_cache, &gt);
+        if (!ptn_converted[i]) {
+            auto [tcmd, tparam] = ptnTempoInject[i];
+            ConvertPattern(swm.patterns[i + 1], gt.patterns[i],
+                           spdBuilder, tcmd, tparam,
+                           swm.chords.empty() ? nullptr : &swm.chords,
+                           &arp_cache, &gt, &oct_shifts, nullptr);
+        }
     }
 
     /* Commit speedtable (may have entries from tempo and/or slide effects) */
