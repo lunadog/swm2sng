@@ -8,14 +8,22 @@
  * SWM pattern block format
  * ------------------------
  * Each pattern block: [packed row data ...][SIZE byte][LENGTH byte]
- *   LENGTH = row count (detected by peeking ahead: when the byte two
- *            positions ahead equals rows parsed so far, the current
- *            byte is SIZE and the next is LENGTH).
+ *   LENGTH = row count.  SID-Wizard detects it by reading the file
+ *   backwards (LENGTH and SIZE are at the end of each block); we detect
+ *   it by parsing forward and peeking ahead: when the byte two positions
+ *   ahead equals rows parsed so far, the current byte is SIZE and the
+ *   next is LENGTH.
  *
  * Row encoding in the packed stream:
- *   0x00        = rest (SW1_PTNCOL1_REST) — gate stays on
- *   0x7E        = keyoff (SW1_PTNCOL1_KEYOFF) — gate off, release envelope
- *   0x70..0x77  = rest run: (byte - 0x70 + 2) consecutive rest rows (0x00)
+ *   Terminology (per SID-Wizard author):
+ *     0x00 = 'tick' / empty row — note continues uninterrupted.
+ *     0x7E = 'rest' / gate-off — the '---' sign in C64 music editors.
+ *   The word 'rest' in comments here always means the gate-off (0x7E),
+ *   not the empty tick row (0x00).
+ *
+ *   0x00        = empty row / tick (SW1_PTNCOL1_REST) — note continues
+ *   0x7E        = gate-off / rest (SW1_PTNCOL1_KEYOFF) — release envelope
+ *   0x70..0x77  = empty-row run: (byte - 0x70 + 2) consecutive empty rows
  *   0x01..0x6F, 0x78..0x7D, 0x7F
  *               = plain note (no instrument byte follows)
  *   0x80..0xFF  = note WITH instrument byte following
@@ -23,13 +31,28 @@
  *       FX < SW1_SMALLFX_MIN -> parameter byte follows (big FX)
  *       FX >= SW1_SMALLFX_MIN -> no parameter byte (small FX)
  *
- * Sequence format:
- *   [pattern-ref bytes ...][0xFF loop-marker][restart-pos byte][size byte]
+ * Sequence format (from SWM-spec.src):
+ *   0xFF (loop/jump):    [refs...][0xFF][restart-pos][size]
+ *   0xFE (end-of-tune):  [refs...][0xFE][size]  (no restart byte)
+ *
+ * Music data order (from SWM-spec.src):
+ *   sequences → patterns → instruments → chord table → tempo table → subtune tempos
  *
  * Instrument table format:
  *   [SW1_INSTRUMENT_PARAMSIZE param bytes]
  *   [table bytes, last byte encodes total instrument size]
  *   [SW1_INSTRUMENT_NAMESIZE name bytes]
+ *
+ * Chord / arpeggio implementation
+ * --------------------------------
+ * SID-Wizard has a global chord table (arpeggios shared across instruments).
+ * GT2 has no direct equivalent.  Per the SID-Wizard author's suggestion, we
+ * implement chords by:
+ *   1. Appending one arp sequence per unique chord to the GT2 wave table
+ *      (3 entries of [0x00, GT2_ARP_REL_MIN+offset] + jump-to-self).
+ *   2. Using GT2_COMMAND_WAVETBL in the pattern row to redirect the wave
+ *      table pointer to that arp sequence.
+ *   The instrument itself is unchanged — no cloning is required.
  ********************************************/
 
 #include <cstdio>
@@ -43,6 +66,7 @@
 #include <map>
 #include <stdexcept>
 #include "swm.h"
+#include <set>
 #include "sng.h"
 
 /*************************************************************
@@ -101,7 +125,7 @@ struct SWMFile {
 
     /* Global chord table (chordtable_length / 3 entries).
      * Each chord = 3 semitone offsets from the root note (0 = root). */
-    std::vector<std::array<uint8_t,3>> chords;
+    std::vector<std::vector<uint8_t>> chords;
 };
 
 /*************************************************************
@@ -192,44 +216,45 @@ void LoadSWM(const char* path, SWMFile& swm) {
     printf("Instruments: %d\n", swm.header.instrument_count);
 
     /*---------------------------------------------------------
-     * Read chord table (if present)
-     * Located immediately after the header, before sequences.
-     * Format: chordtable_length / 3 chords, each chord = 3
-     * semitone offsets [off0, off1, off2] from the root note.
-     * Offset 0 = play root note; positive = semitones above root.
-     *---------------------------------------------------------*/
-    if (swm.header.chordtable_length > 0) {
-        int num_chords = swm.header.chordtable_length / 3;
-        swm.chords.resize(num_chords);
-        for (int i = 0; i < num_chords; i++) {
-            swm.chords[i][0] = read8(f);
-            swm.chords[i][1] = read8(f);
-            swm.chords[i][2] = read8(f);
-        }
-        /* If length is not a multiple of 3, consume the remainder */
-        for (int r = num_chords * 3; r < swm.header.chordtable_length; r++)
-            read8(f);
-        printf("  Chord table: %d chords\n", num_chords);
-    }
-
-    /*---------------------------------------------------------
      * Read sequences
-     * Format: [pattern-ref bytes...][0xFF loop-marker]
-     *         [restart-pos byte][size byte]
-     * We read until 0xFF, then two more bytes.
+     *
+     * Per SWM-spec.src, the music data order is:
+     *   sequences → patterns → instruments → chord table → tempo table → subtune tempos
+     * Sequences start immediately after the 64-byte header (no chord table here).
+     *
+     * From SWM-spec.src and the SID-Wizard exporter source:
+     *
+     *   0xFF  Loop/jump — [refs...][0xFF][restart-pos][size]
+     *            restart-pos: sequence entry to loop back to
+     *            size:        total byte count of this sequence
+     *                         (used by the player reading backwards; discarded here)
+     *
+     *   0xFE  End of tune, stop playback — [refs...][0xFE][size]
+     *            size: byte count of this sequence (no restart byte for 0xFE)
+     *
+     * The spec example:
+     *   1,1,1,FE,(4)         => 3 refs + FE + size=4        (3+1=4)
+     *   2,2,2,FF,01,(5)      => 3 refs + FF + restart + size (3+2=5)
+     *   3,4,5,6,7,FF,02,(7)  => 5 refs + FF + restart + size (5+2=7)
      *---------------------------------------------------------*/
     swm.sequences.resize(swm.header.sequence_count);
     for (int i = 0; i < swm.header.sequence_count; i++) {
         SW_Sequence& seq = swm.sequences[i];
         for (;;) {
             uint8_t c = read8(f);
-            if (c == SW1_SEQUENCE_LOOPSONG || c == SW1_SEQUENCE_ENDSONG) {
-                seq.restart_pos = read8(f); /* restart position */
-                read8(f);                    /* size byte (discard) */
+            if (c == SW1_SEQUENCE_LOOPSONG) {   /* 0xFF: loop/jump */
+                seq.restart_pos = read8(f);     /* restart-position byte */
+                read8(f);                       /* size byte — discard */
+                break;
+            }
+            if (c == SW1_SEQUENCE_ENDSONG) {    /* 0xFE: end of tune */
+                read8(f);                       /* size byte — discard (no restart) */
                 break;
             }
             seq.data.push_back(c);
         }
+        printf("  Sequence %d: %zu entries, restart=%d\n",
+               i + 1, seq.data.size(), seq.restart_pos);
     }
 
     /*---------------------------------------------------------
@@ -368,6 +393,37 @@ void LoadSWM(const char* path, SWMFile& swm) {
     }
 
     /*---------------------------------------------------------
+     * Read chord table (if present)
+     * Per SWM-spec.src, chord table comes after instruments.
+     * Format: variable-length semitone-offset entries, each entry
+     * terminated by 0x7E or 0x7F.  Total byte count is given by
+     * header.chordtable_length.
+     * Chord index in patterns: instrument-column byte 0x70..0x7F,
+     * lower nibble = chord index (0..15).
+     *---------------------------------------------------------*/
+    if (swm.header.chordtable_length > 0) {
+        int remaining = swm.header.chordtable_length;
+        while (remaining > 0) {
+            std::vector<uint8_t> entry;
+            while (remaining > 0) {
+                uint8_t b = read8(f); remaining--;
+                if (b == 0x7E || b == 0x7F) break; /* chord terminator */
+                entry.push_back(b);
+            }
+            swm.chords.push_back(entry);
+        }
+        printf("  Chord table: %zu chords\n", swm.chords.size());
+    }
+
+    /*---------------------------------------------------------
+     * Read tempo table (if present)
+     * Comes after chord table; total byte count in header.
+     * We skip it — tempo is handled via the subtune tempos below.
+     *---------------------------------------------------------*/
+    for (int i = 0; i < swm.header.tempotable_length; i++)
+        read8(f);
+
+    /*---------------------------------------------------------
      * Read subtune tempos (2 bytes per subtune)
      *---------------------------------------------------------*/
     swm.tempos.resize(subtunes);
@@ -431,9 +487,9 @@ static std::vector<uint8_t> UnpackPattern(const std::vector<uint8_t>& packed) {
         uint8_t b = packed[i++];
 
         if (b >= 0x70 && b <= 0x77) {
-            /* Rest run: expands to (b-0x70+2) plain rest rows = 0x00 each.
-             * 0x00 = SW1_PTNCOL1_REST (gate stays on, note continues).
-             * 0x7E = SW1_PTNCOL1_KEYOFF (gate off) — a distinct value. */
+            /* Empty-row run: expands to (b-0x70+2) empty rows = 0x00 each.
+             * 0x00 = SW1_PTNCOL1_REST ('tick', note continues uninterrupted).
+             * 0x7E = SW1_PTNCOL1_KEYOFF ('rest'/gate-off) — a distinct value. */
             int count = (b - 0x70) + 2;
             for (int k = 0; k < count; k++)
                 out.push_back(0x00);
@@ -565,91 +621,73 @@ static uint8_t SWsldToGTspd(uint8_t SWsld, uint8_t Dpitch,
 }
 
 /*************************************************************
- * CreateArpInstrument
- * Creates (or retrieves from cache) a GT2 instrument that is
- * a clone of `base_gt_idx` but with its wave table replaced
- * by one that cycles through the given 3-note chord arpeggio.
+ * GetOrCreateArpWtPos
+ * Returns (or creates) a GT2 wave table position for the given
+ * chord arpeggio.
+ *
+ * Per the SID-Wizard author's suggestion, chords are implemented
+ * by placing arp sequences directly in the GT2 wave table and
+ * using GT2_COMMAND_WAVETBL in the pattern to redirect the wave
+ * table pointer there.  No instrument cloning is needed.
  *
  * chord[3]: semitone offsets from root (0 = root, e.g. {0,4,7}
- * for a major chord).
+ * for a major chord).  Only non-zero entries generate arp steps;
+ * the first zero terminates the arp cycle (or all 3 are used).
  *
- * The wave table entries are built as:
- *   [orig_waveform, rel+chord[0]]   <- set waveform + root
- *   [0x00,          rel+chord[1]]   <- arp step 1 (no wf change)
- *   [0x00,          rel+chord[2]]   <- arp step 2
- *   [GT2_TABLE_JUMP, 0x00]          <- loop back to start
+ * Wave table arp sequence (N steps + loop, all left=0x00 so the
+ * waveform set by the instrument's own wave table is preserved):
+ *   [0x00, arp_val(chord[0])]  step 0
+ *   [0x00, arp_val(chord[1])]  step 1  (if non-zero)
+ *   [0x00, arp_val(chord[2])]  step 2  (if non-zero)
+ *   [0xFF, self_pos]           loop back to this sequence's start
  *
- * If the original instrument has no wave table (gi.wv == 0),
- * uses frame1_waveform as the waveform byte for the first entry.
- *
- * Returns the 0-based GT2 instrument index of the arp clone.
+ * arp_cache maps chord_num → 1-based wave table start position.
+ * Returns 0 if the wave table is full.
  *************************************************************/
-static int CreateArpInstrument(
-        int                                 base_gt_idx,
-        const std::array<uint8_t,3>&        chord,
-        GT2File&                            gt,
-        sng_table&                          wt,
-        std::map<std::pair<int,int>,int>&   arp_cache,
-        int                                 chord_num)
+static uint8_t GetOrCreateArpWtPos(
+        int                               chord_num,
+        const std::vector<uint8_t>&       chord,
+        sng_table&                        wt,
+        std::map<int,uint8_t>&            arp_cache)
 {
-    auto key = std::make_pair(base_gt_idx, chord_num);
-    auto it = arp_cache.find(key);
+    auto it = arp_cache.find(chord_num);
     if (it != arp_cache.end())
         return it->second;
 
-    /* Clone the base instrument */
-    sng_instrument clone = gt.instruments[base_gt_idx];
-    int new_idx = (int)gt.instruments.size();
-    gt.instruments.push_back(clone);
+    /* Use all chord entries — zeros are root-note steps, not padding */
+    int n_steps = (int)chord.size();
+    if (n_steps < 1) n_steps = 1;
 
-    /* Determine the waveform to use for the first arp entry.
-     * Prefer the first entry of the existing wave table; fall back to
-     * the instrument's frame1_waveform (hr field). */
-    uint8_t wf_byte = clone.hr ? clone.hr : 0x21; /* default: sawtooth+gate */
-    if (clone.wv > 0 && wt.left && (clone.wv - 1) < wt.length)
-        wf_byte = wt.left[clone.wv - 1]; /* first wt entry's waveform */
-
-    /* Build arp wave table entries appended to the global wave table.
-     * All offsets converted: SW semitone offset → GT2 relative arp value.
-     * GT2_ARP_REL_MIN (0x80) + offset = relative semitone up.
-     * Offset 0 → 0x00 (no arpeggio, stay at current note). */
-    auto sw_to_gt2_arp = [](uint8_t sw_offset) -> uint8_t {
-        if (sw_offset == 0) return 0x00;
-        return (uint8_t)(GT2_ARP_REL_MIN + sw_offset);
-    };
-
-    /* Append to the pre-allocated wave table (255 bytes max). */
-    if (wt.length + 4 > 255) {
-        printf("  WARNING: wave table full, cannot add chord arp for instr %d chord %d\n",
-               base_gt_idx + 1, chord_num);
-        arp_cache[key] = base_gt_idx;
-        gt.instruments.pop_back();
-        return base_gt_idx;
+    int needed = n_steps + 1; /* steps + jump */
+    if (wt.length + needed > 255) {
+        printf("  WARNING: wave table full, cannot add chord %d arp\n", chord_num);
+        return 0;
     }
 
-    uint8_t arp_start = (uint8_t)(wt.length + 1); /* 1-based index */
-    wt.left [wt.length] = wf_byte;                 /* step 0: set waveform + root */
-    wt.right[wt.length] = sw_to_gt2_arp(chord[0]);
-    wt.length++;
-    wt.left [wt.length] = 0x00;                    /* step 1: no waveform change */
-    wt.right[wt.length] = sw_to_gt2_arp(chord[1]);
-    wt.length++;
-    wt.left [wt.length] = 0x00;                    /* step 2: no waveform change */
-    wt.right[wt.length] = sw_to_gt2_arp(chord[2]);
-    wt.length++;
-    wt.left [wt.length] = GT2_TABLE_JUMP;           /* loop back to arp start */
-    wt.right[wt.length] = 0x00;
+    auto sw_to_gt2_arp = [](uint8_t sw_offset) -> uint8_t {
+        /* SW chord table offsets are positive semitone counts (0x00..0x5F).
+         * In the GT2 wave table right column, 0x01..0x5F are also direct
+         * positive semitone offsets.  No constant offset needed. */
+        return sw_offset;
+    };
+
+    uint8_t arp_start = (uint8_t)(wt.length + 1); /* 1-based */
+    for (int s = 0; s < n_steps; s++) {
+        wt.left [wt.length] = 0x00;
+        wt.right[wt.length] = sw_to_gt2_arp(chord[s]);
+        wt.length++;
+    }
+    wt.left [wt.length] = GT2_TABLE_JUMP;
+    wt.right[wt.length] = arp_start;
     wt.length++;
 
-    gt.instruments[new_idx].wv = arp_start;
+    printf("  Chord %d (%zu steps) -> wave table pos %d\n",
+           chord_num, chord.size(), arp_start);
 
-    printf("  Created arp instrument %d (base %d, chord %d: +%d+%d+%d) -> wt pos %d\n",
-           new_idx + 1, base_gt_idx + 1, chord_num,
-           chord[0], chord[1], chord[2], arp_start);
-
-    arp_cache[key] = new_idx;
-    return new_idx;
+    arp_cache[chord_num] = arp_start;
+    return arp_start;
 }
+
 /*************************************************************
  * ConvertPattern
  * Translates one SW pattern to a GT2 sng_pattern.
@@ -657,15 +695,15 @@ static int CreateArpInstrument(
  * tempo_cmd / tempo_param: if non-zero, written into row 0's
  * COMMAND column (no extra row is inserted).
  *
- * chords / arp_cache / gt_file / wt_out: used to materialise
- * chord-table arpeggios as duplicate GT2 instruments.
+ * chords / arp_cache / gt_file: used to materialise chord-table
+ * arpeggios as wave table sequences (no instrument cloning).
  *************************************************************/
 static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
                            SpeedTableBuilder& spdBuilder,
                            uint8_t tempo_cmd   = 0,
                            uint8_t tempo_param = 0,
-                           const std::vector<std::array<uint8_t,3>>* chords      = nullptr,
-                           std::map<std::pair<int,int>,int>*          arp_cache   = nullptr,
+                           const std::vector<std::vector<uint8_t>>* chords      = nullptr,
+                           std::map<int,uint8_t>*                    arp_cache   = nullptr,
                            GT2File*                                   gt_file     = nullptr,
                            const std::vector<int8_t>*                 oct_shifts  = nullptr,
                            uint8_t*                                   inout_instr = nullptr) {
@@ -688,6 +726,16 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
      * SID-Wizard).  Written back to inout_instr at the end of the pattern. */
     uint8_t cur_instr = (inout_instr && *inout_instr) ? *inout_instr : 0;
 
+    /* Portamento carry-over.
+     * In SID-Wizard, a portamento (slide) FX set on one row continues on every
+     * following row until cancelled.  In GT2, GT2_COMMAND_TONEPORT must be
+     * re-written on every row where the slide should still be active.
+     * We track the active portamento command and parameter here and re-emit on
+     * every empty/gate-off row while the slide is active.  A new note row
+     * without a fresh portamento FX cancels the slide. */
+    uint8_t port_cmd   = 0;
+    uint8_t port_param = 0;
+
     while (idx < unpacked.size() && row < gt.rows - 1) {
         sng_pattern_row& r = gt.data[row];
         uint8_t note    = unpacked[idx++];
@@ -699,24 +747,30 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
          * this very row (not just the following rows). */
         if (hasInstr && idx < unpacked.size()) {
             uint8_t peek_instr = unpacked[idx] & 0x7F;
-            if (peek_instr >= SW1_INSTRUMENT_MIN &&
-                peek_instr <= SW1_INSTRUMENT_MAX)
-                cur_instr = peek_instr;
+            if ((peek_instr >= SW1_INSTRUMENT_MIN &&
+                 peek_instr <= SW1_INSTRUMENT_MAX) ||
+                (peek_instr >= 0x70 && peek_instr <= 0x7F))
+                cur_instr = (peek_instr <= SW1_INSTRUMENT_MAX) ? peek_instr : cur_instr;
         }
 
         /* Map SW note value -> GT2 note value.
          *
-         * Encoding in SID-Wizard packed pattern stream (confirmed by binary analysis):
-         *   0x00        = rest (gate stays on, note continues)
-         *   0x7E        = keyoff (SW1_PTNCOL1_KEYOFF) — explicit gate-off
-         *   0x70..0x77  = rest run (already expanded to 0x00 by UnpackPattern)
+         * SID-Wizard packed pattern stream encoding:
+         *   0x00        = empty row / tick (note continues, gate stays on)
+         *   0x7E        = gate-off / rest (SW1_PTNCOL1_KEYOFF) — release envelope
+         *   0x70..0x77  = empty-row run (already expanded to 0x00 by UnpackPattern)
          *   0x80+       = note with instrument byte
          *   0x01..0x6F  = plain note (no instrument byte) */
         if (note == 0x00) {
             r.note = GT2_PATTERN_REST;
+            /* Re-emit active portamento on every continuing empty row.
+             * In SID-Wizard a slide FX set once stays active; in GT2 it
+             * must be written on every row where the slide continues. */
+            if (port_cmd) { r.command = port_cmd; r.parameter = port_param; }
         } else if (note == 0x7E || noteVal == SW1_PTNCOL1_KEYOFF) {
-            /* 0x7E = SW1_PTNCOL1_KEYOFF: explicit gate-off */
-            r.note = GT2_PATTERN_KEYOFF;
+            /* gate-off: cancel any active slide */
+            r.note   = GT2_PATTERN_KEYOFF;
+            port_cmd = port_param = 0;
         } else if (noteVal == SW1_PTNCOL1_KEYON) {
             r.note = GT2_PATTERN_KEYON;
         } else if (noteVal == SW1_PTNCOL1_END) {
@@ -743,13 +797,20 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
 
             r.note = (uint8_t)gt2_note;
             Dpitch = noteVal;
+            /* A new pitched note without a fresh portamento FX cancels the slide */
+            port_cmd = port_param = 0;
         } else {
             r.note = GT2_PATTERN_REST;
         }
 
         r.instrument = 0;
-        r.command    = GT2_COMMAND_NOP;
-        r.parameter  = 0;
+        /* Only reset command/parameter for rows that haven't already had the
+         * portamento carry-over written.  For empty rows (note==0x00) the
+         * carry-over was set above and must not be overwritten here. */
+        if (note != 0x00) {
+            r.command   = GT2_COMMAND_NOP;
+            r.parameter = 0;
+        }
 
         /* Inject header tempo into row 0's command column (no extra row). */
         if (row == 0 && tempo_cmd != 0) {
@@ -769,6 +830,26 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
         if (!hasFX && instrVal == SW1_LEGATO) {
             r.command   = GT2_COMMAND_TONEPORT;
             r.parameter = 0;  /* legato = toneport with speed 0 */
+        } else if (instrVal >= 0x70 && instrVal <= 0x7F) {
+            /* $70..$7F in the instrument column = Set Chord (override default).
+             * SW chord numbers in pattern data are 1-based: 0x71 = chord 1,
+             * 0x72 = chord 2, etc.  Convert to 0-based index. */
+            uint8_t chord_num_1based = instrVal & 0x0F;
+            if (chord_num_1based > 0) {
+                uint8_t chord_num = chord_num_1based - 1;
+                if (chords && arp_cache && gt_file &&
+                    chord_num < (uint8_t)chords->size()) {
+                    uint8_t wt_pos = GetOrCreateArpWtPos(
+                                         (int)chord_num,
+                                         (*chords)[chord_num],
+                                         gt_file->wavetable,
+                                         *arp_cache);
+                    if (wt_pos != 0) {
+                        r.command   = GT2_COMMAND_WAVETBL;
+                        r.parameter = wt_pos;
+                    }
+                }
+            }
         } else if (instrVal >= SW1_INSTRUMENT_MIN &&
                    instrVal <= SW1_INSTRUMENT_MAX) {
             r.instrument = instrVal;
@@ -794,6 +875,24 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
             if (fxbase == SW1_SMALLFX_MAINVOL) {
                 r.command   = GT2_COMMAND_VOLUME;
                 r.parameter = fxnybbl;
+            } else if (fxbase == 0x70) {
+                /* 0x70..0x7F in the FX column = Set Chord.
+                 * SW chord numbers are 1-based: 0x71=chord1, 0x72=chord2, etc. */
+                if (fxnybbl > 0) {
+                    uint8_t chord_num = fxnybbl - 1;
+                    if (chords && arp_cache && gt_file &&
+                        chord_num < (uint8_t)chords->size()) {
+                        uint8_t wt_pos = GetOrCreateArpWtPos(
+                                             (int)chord_num,
+                                             (*chords)[chord_num],
+                                             gt_file->wavetable,
+                                             *arp_cache);
+                        if (wt_pos != 0) {
+                            r.command   = GT2_COMMAND_WAVETBL;
+                            r.parameter = wt_pos;
+                        }
+                    }
+                }
             }
             row++; continue;
         }
@@ -804,26 +903,23 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
             fxval = unpacked[idx++];
 
         switch (fx) {
-            /* Chord/arpeggio: create a duplicate instrument with an
-             * arp wave table built from the global chord table entry.
-             * The FX is dropped from the pattern (arp lives in wave table). */
+            /* Chord/arpeggio: append an arp sequence to the GT2 wave table
+             * and emit GT2_COMMAND_WAVETBL to redirect the wave table pointer
+             * there.  The instrument is unchanged — no cloning needed. */
             case SW1_BIGFX_SETCHORD: {
                 if (chords && arp_cache && gt_file &&
-                    fxval < (uint8_t)chords->size() &&
-                    r.instrument >= 1)
+                    fxval < (uint8_t)chords->size())
                 {
-                    int base_gt = r.instrument - 1; /* 0-based */
-                    int new_gt  = CreateArpInstrument(
-                                      base_gt,
-                                      (*chords)[fxval],
-                                      *gt_file,
-                                      gt_file->wavetable,
-                                      *arp_cache,
-                                      (int)fxval);
-                    r.instrument = (uint8_t)(new_gt + 1); /* 1-based */
+                    uint8_t wt_pos = GetOrCreateArpWtPos(
+                                         (int)fxval,
+                                         (*chords)[fxval],
+                                         gt_file->wavetable,
+                                         *arp_cache);
+                    if (wt_pos != 0) {
+                        r.command   = GT2_COMMAND_WAVETBL;
+                        r.parameter = wt_pos;
+                    }
                 }
-                r.command   = GT2_COMMAND_NOP;
-                r.parameter = 0;
                 break;
             }
 
@@ -832,18 +928,22 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
             case SW1_BIGFX_PORTUP:
                 r.command   = GT2_COMMAND_PORTUP;
                 r.parameter = SWsldToGTspd(fxval, Dpitch, spdBuilder);
+                port_cmd = r.command; port_param = r.parameter;
                 break;
             case SW1_BIGFX_PORTDOWN:
                 r.command   = GT2_COMMAND_PORTDOWN;
                 r.parameter = SWsldToGTspd(fxval, Dpitch, spdBuilder);
+                port_cmd = r.command; port_param = r.parameter;
                 break;
             case SW1_BIGFX_TONEPORT:
                 if (fxval == 0) {
                     r.command   = GT2_COMMAND_TONEPORT;
                     r.parameter = 0;  /* legato */
+                    port_cmd = port_param = 0;  /* legato is not a repeating slide */
                 } else {
                     r.command   = GT2_COMMAND_TONEPORT;
                     r.parameter = SWsldToGTspd(fxval, Dpitch, spdBuilder);
+                    port_cmd = r.command; port_param = r.parameter;
                 }
                 break;
             case SW1_BIGFX_VIBRATO:
@@ -994,9 +1094,14 @@ static void SWFilterToGT2Filter(
         }
 
         if (L == 0x00) {
-            /* Pure cutoff-set entry (generated by sng2swm). */
-            fl_left .push_back(0x00);
-            fl_right.push_back(R);
+            /* Pure cutoff-set entry (generated by sng2swm for GT2→SW round-trips).
+             * A single [0x00 0x00 0x00] entry means "filter enabled on this channel
+             * but no cutoff/band control" (per SID-Wizard author); skip the cutoff
+             * emit in that case and let the routing entry suffice. */
+            if (R != 0x00) {
+                fl_left .push_back(0x00);
+                fl_right.push_back(R);
+            }
             continue;
         }
 
@@ -1080,7 +1185,9 @@ static void SWFilterToGT2Filter(
 static void ReconstructTables(
         const std::vector<SW_Instrument>& sw_instr,
         std::vector<sng_instrument>&      gt_instr,
-        const std::vector<uint8_t>&       voice_assignments, /* per-instrument, 1-based */
+        const std::vector<uint8_t>&       voice_assignments,  /* per-instrument, 1-based */
+        const std::vector<uint8_t>&       filter_voice_mask,  /* per-instrument filter routing */
+        const std::vector<std::vector<uint8_t>>* chords_ptr, /* global chord table */
         sng_table& wt, sng_table& pt, sng_table& ft)
 {
     std::vector<uint8_t> wv_left, wv_right;
@@ -1103,11 +1210,57 @@ static void ReconstructTables(
 
         /* ---- Wave table ---- */
         uint8_t wv_start = (uint8_t)(wv_left.size() + 1);
-        for (uint8_t t = 0; t + 1 < pulse_offset && t + 1 < (uint8_t)tbl.size(); t += 3) {
-            uint8_t L = tbl[t], R = tbl[t+1];
-            if (L == SW1_TABLE_END)  break;
-            if (L == SW1_TABLE_JUMP) L = GT2_TABLE_JUMP;
-            /* The arpeggio right byte: relative arpeggio uses SW1_ARP_REL_MIN offset. */
+        bool wv_terminated = false;
+        for (uint8_t t = 0; t < pulse_offset && t < (uint8_t)tbl.size(); t += 3) {
+            uint8_t L = tbl[t];
+            uint8_t R = (t + 1 < (uint8_t)tbl.size()) ? tbl[t+1] : 0;
+
+            if (L == SW1_TABLE_END) {
+                /* 0xFF in SW = end of table: emit GT2 stop (FF 00) */
+                wv_left.push_back(GT2_TABLE_JUMP);
+                wv_right.push_back(0x00);
+                wv_terminated = true;
+                break;
+            }
+            if (L == SW1_TABLE_JUMP) {
+                /* 0xFE in SW = loop/jump: R is the SW byte offset (0-based).
+                 * Convert to a GT2 1-based table position. */
+                uint8_t gt_target = (uint8_t)(wv_start + R / 3);
+                wv_left.push_back(GT2_TABLE_JUMP);
+                wv_right.push_back(gt_target);
+                wv_terminated = true;
+                break;
+            }
+
+            /* R = 0x7F = SW1_TABLEJTOCORD: expand instrument's default chord inline */
+            if (R == 0x7F && chords_ptr && !chords_ptr->empty()) {
+                uint8_t chord_idx = si.params.default_chord;
+                if (chord_idx > 0) chord_idx -= 1;
+                if (chord_idx < (uint8_t)chords_ptr->size()) {
+                    const auto& chord = (*chords_ptr)[chord_idx];
+                    int n_steps = (int)chord.size();
+                    if (n_steps < 1) n_steps = 1;
+                    
+                    auto to_gt2_arp = [](uint8_t sw_off) -> uint8_t {
+                        /* Chord offsets (0x00..0x5F) are direct GT2 arp values */
+                        return sw_off;
+                    };
+                    for (int s = 0; s < n_steps; s++) {
+                        wv_left.push_back(s == 0 ? L : 0x00);
+                        wv_right.push_back(to_gt2_arp(chord[s]));
+                    }
+                }
+                /* The chord must loop continuously: emit a jump back to the start
+                 * of this instrument's wave table entries, then stop processing.
+                 * Do NOT fall through to the next entry (which would be the 0xFF
+                 * stop marker, causing the arp to play only once). */
+                wv_left.push_back(GT2_TABLE_JUMP);
+                wv_right.push_back(wv_start);
+                wv_terminated = true;
+                break;
+            }
+
+            /* Normal arp conversion */
             if (R >= SW1_ARP_REL_MIN)
                 R -= (SW1_ARP_REL_MIN - GT2_ARP_REL_MIN);
             else if (R >= SW1_ARP_ABS_MIN && R <= SW1_ARP_ABS_MAX)
@@ -1115,23 +1268,35 @@ static void ReconstructTables(
             wv_left.push_back(L);
             wv_right.push_back(R);
         }
-        if ((uint8_t)wv_left.size() >= wv_start) {
+        /* Only add a loop-back if the SW table had no explicit terminator.
+         * If it ended with 0xFF (stop) we already emitted FF 00.
+         * If it ended with 0xFE (jump) we already emitted the jump.
+         * If it simply ran to the boundary with no terminator, add a loop. */
+        if (!wv_terminated && (uint8_t)wv_left.size() >= wv_start) {
             wv_left.push_back(GT2_TABLE_JUMP);
-            wv_right.push_back(0x00);
+            wv_right.push_back(wv_start);
         }
         gi.wv = (wv_start <= (uint8_t)wv_left.size()) ? wv_start : 0;
 
         /* ---- Pulse table ---- */
         uint8_t pl_start = (uint8_t)(pl_left.size() + 1);
-        for (uint8_t t = pulse_offset;
-             t < filter_offset && t + 1 < (uint8_t)tbl.size(); t += 3) {
-            uint8_t L = tbl[t], R = tbl[t+1];
-            if (L == SW1_TABLE_END)  break;
-            if (L == SW1_TABLE_JUMP) L = GT2_TABLE_JUMP;
+        bool pl_terminated = false;
+        for (uint8_t t = pulse_offset; t < filter_offset && t < (uint8_t)tbl.size(); t += 3) {
+            uint8_t L = tbl[t];
+            uint8_t R = (t + 1 < (uint8_t)tbl.size()) ? tbl[t+1] : 0;
+            if (L == SW1_TABLE_END) {
+                pl_left.push_back(GT2_TABLE_JUMP); pl_right.push_back(0x00);
+                pl_terminated = true; break;
+            }
+            if (L == SW1_TABLE_JUMP) {
+                uint8_t gt_target = (uint8_t)(pl_start + (R - pulse_offset) / 3);
+                pl_left.push_back(GT2_TABLE_JUMP); pl_right.push_back(gt_target);
+                pl_terminated = true; break;
+            }
             pl_left.push_back(L);
             pl_right.push_back(R);
         }
-        if ((uint8_t)pl_left.size() >= pl_start) {
+        if (!pl_terminated && (uint8_t)pl_left.size() >= pl_start) {
             pl_left.push_back(GT2_TABLE_JUMP);
             pl_right.push_back(0x00);
         }
@@ -1154,10 +1319,13 @@ static void ReconstructTables(
         uint8_t initial_ctrl = si.params.arpchord_speed; /* byte[4] */
 
         if (has_filter) {
-            uint8_t vmask = (i < voice_assignments.size()) ? voice_assignments[i] : 0x07;
-            if (vmask == 0) vmask = 0x07; /* fallback: all voices */
-            SWFilterToGT2Filter(filter_section, vmask, initial_ctrl, fl_left, fl_right);
-            /* SWFilterToGT2Filter emits its own stop/jump entry. */
+            /* filter_voice_mask[i] = 0 means this instrument is not the designated
+             * filter setter at any orderlist position — skip it entirely (gi.fl stays 0).
+             * A non-zero mask means this instrument owns the filter at some positions;
+             * use that exact mask (no fallback). */
+            uint8_t fmask = (i < filter_voice_mask.size()) ? filter_voice_mask[i] : 0;
+            if (fmask != 0)
+                SWFilterToGT2Filter(filter_section, fmask, initial_ctrl, fl_left, fl_right);
         }
 
         gi.fl = (fl_start <= (uint8_t)fl_left.size()) ? fl_start : 0;
@@ -1261,12 +1429,12 @@ static void ConvertInstrument(const SW_Instrument& si,
     gi.sr = si.params.sr;
 
     /* ---- Frame-1 waveform ----
-     * In SID-Wizard the flag.wframe1 bit controls whether the player
-     * outputs frame1_waveform to the SID chip before the wave table starts.
-     * In GT2 this is the instrument's "first-frame waveform" (gi.hr field).
-     * Only copy it when the flag is actually set; otherwise GT2 should see 0
-     * (which means "don't force a waveform on note trigger"). */
-    gi.hr = si.params.flag.wframe1 ? si.params.frame1_waveform : 0;
+     * frame1_waveform (params[15]) is the hard-restart waveform applied on
+     * every note trigger in SID-Wizard (test-bit + gate = 0x09 is standard).
+     * The wframe1 flag controls something else and does NOT gate whether
+     * this waveform is applied.  Always copy it to gi.hr; leaving gi.hr=0
+     * would suppress the hard restart entirely, making the instrument silent. */
+    gi.hr = si.params.frame1_waveform;
 
     /* ---- Hard restart timer ----
      * flag.hrtimer: 0=none, 1=frame-counter HR, 2=gate-off HR.
@@ -1434,80 +1602,356 @@ void Convert(const SWMFile& swm, GT2File& gt) {
     for (int i = 0; i < swm.header.instrument_count; i++)
         voice_assignments[i] = instr_voice_mask[i + 1]; /* SW 1-based -> GT2 0-based */
 
-    /* Check if any filter-bearing instrument is used on multiple voices.
-     * If so, duplicate it: one GT2 instrument per voice, each with its voice mask.
-     * We also need to patch all pattern references to point to the duplicate. */
-    auto instr_has_filter = [&](int sw_idx) -> bool {
-        /* sw_idx is 0-based.  An instrument has a filter only when its combined
-         * table section contains actual filter bytes — i.e. when filter_offset
-         * is strictly less than the table size (excluding the size marker byte).
-         * We do NOT check initial_ctrl (byte[4]) here because that field is
-         * present in all instruments and does not indicate a filter table. */
-        const SW_Instrument& si = swm.instruments[sw_idx];
-        const auto& tbl = si.tables;
-        uint8_t filter_offset =
-            (si.params.filtertb_index >= SW1_INSTRUMENT_PARAMSIZE)
-            ? si.params.filtertb_index - SW1_INSTRUMENT_PARAMSIZE
-            : (uint8_t)tbl.size();
-        return filter_offset < (uint8_t)(tbl.size() - 1);
-    };
+    /* GT2 has a single global filter: only ONE instrument's filter table is
+     * active at a time, and having multiple filter instruments simultaneously
+     * causes them to cancel each other out.
+     *
+     * Strategy (per user guidance):
+     *   1. Find the first filter-bearing instrument that plays on voice 1 (ch1).
+     *      If none plays on voice 1, use the first filter-bearing instrument found.
+     *   2. That instrument becomes the "primary" filter owner.  Its filter table
+     *      in GT2 uses the ALL-channels mask (0x07) so the filter always affects
+     *      every voice, matching SID-Wizard's global SID filter.
+     *   3. All other filter-bearing instruments get their gi.fl set to 0 (no filter
+     *      table in GT2).  In SID-Wizard the filter is a shared hardware resource,
+     *      not per-instrument, so this is the correct semantic mapping.
+     *
+     * voice_assignments[i] is still computed for completeness (pulse tables, etc.) */
 
-    /* Map: (sw_instr_1based, voice_bit) -> new GT2 instrument index (0-based) */
-    std::map<std::pair<int,int>, int> instr_voice_to_gt;
-    /* Populate with the existing instruments (which own the FIRST voice bit set) */
-    for (int i = 0; i < swm.header.instrument_count; i++) {
-        uint8_t vmask = voice_assignments[i];
-        if (!instr_has_filter(i) || (vmask & (vmask-1)) == 0) {
-            /* No duplication needed */
-            int first_bit = (vmask != 0) ? (vmask & -vmask) : 1; /* lowest set bit */
-            instr_voice_to_gt[{i + 1, first_bit}] = i;
-        } else {
-            /* Split: one GT2 instrument per voice bit */
-            bool first = true;
-            for (int b = 0; b < 3; b++) {
-                if (!(vmask & (1 << b))) continue;
-                int vbit = (1 << b);
-                if (first) {
-                    instr_voice_to_gt[{i + 1, vbit}] = i;
-                    voice_assignments[i] = (uint8_t)vbit; /* this copy owns voice b */
-                    first = false;
-                } else {
-                    int new_idx = (int)gt.instruments.size();
-                    gt.instruments.push_back(gt.instruments[i]); /* copy base instr */
-                    voice_assignments.push_back((uint8_t)vbit);
-                    instr_voice_to_gt[{i + 1, vbit}] = new_idx;
-                    printf("  Duplicated instrument %d ('%s') for voice %d as GT2 instr %d\n",
-                           i + 1, swm.instruments[i].name, b + 1, new_idx + 1);
+    /*---------------------------------------------------------
+     * Per-instrument filter voice mask.
+     *
+     * SID-Wizard's SID filter is global hardware — whichever instrument
+     * last writes to the filter registers wins.  In GT2, multiple
+     * simultaneously-active filter table entries cancel each other, so
+     * at any given orderlist position only ONE instrument should be the
+     * designated filter setter.
+     *
+     * Rule: for each voice, the filter instrument that appears most
+     * frequently on that voice is elected "voice primary".  At each
+     * orderlist position the voice-1 primary is designated (fallback
+     * to voice 2, then 3).  The designated instrument gets the
+     * simultaneous channel mask for that position.
+     *
+     * When the same instrument plays at positions with DIFFERENT
+     * simultaneous masks (e.g. sometimes all-3-channels, sometimes
+     * ch1-only), a copy of the instrument is created for each distinct
+     * mask.  The orderlist entry pointing to the original instrument
+     * at that position is redirected to the appropriate copy.
+     *---------------------------------------------------------*/
+
+    /* Declare outside the block so it is visible at ReconstructTables call */
+    std::vector<uint8_t> filter_voice_mask(swm.header.instrument_count, 0);
+
+    struct PosFilterInfo { uint8_t designated_iv; uint8_t sim_mask; };
+    std::vector<PosFilterInfo> pos_filter_info; /* per orderlist position */
+
+    /* Maps (sw_instr_1based, channel_mask) -> GT2 instrument index (0-based). */
+    std::map<std::pair<uint8_t,uint8_t>, int> filter_instr_clone;
+
+    {
+        auto instr_has_filter_fn = [&](int iv) -> bool {
+            if (iv < 1 || iv > swm.header.instrument_count) return false;
+            const SW_Instrument& si2 = swm.instruments[iv - 1];
+            uint8_t foff = (si2.params.filtertb_index >= SW1_INSTRUMENT_PARAMSIZE)
+                           ? si2.params.filtertb_index - SW1_INSTRUMENT_PARAMSIZE
+                           : (uint8_t)si2.tables.size();
+            return foff < (uint8_t)(si2.tables.size() - 1);
+        };
+
+        /* Build per-pattern instrument list */
+        std::map<int, std::vector<uint8_t>> ptn_instrs_map;
+        for (int si2 = 0; si2 < subtunes; si2++) {
+            for (int v = 0; v < 3; v++) {
+                const sng_orderlist& ol = gt.orderlists[si2].voice[v];
+                for (int e = 0; e < ol.length; e++) {
+                    uint8_t entry = ol.data[e];
+                    if (entry == SW1_SEQUENCE_LOOPSONG) break;
+                    if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
+                    int ptn_idx = (int)entry + 1;
+                    if (ptn_instrs_map.count(ptn_idx)) continue;
+                    if (ptn_idx >= 1 && ptn_idx <= swm.header.pattern_count) {
+                        std::vector<uint8_t> iv_list;
+                        const auto& up = UnpackPattern(swm.patterns[ptn_idx].packed);
+                        for (size_t ui = 0; ui < up.size(); ) {
+                            uint8_t nb = up[ui++];
+                            if (nb & 0x80) {
+                                if (ui >= up.size()) break;
+                                uint8_t ib = up[ui++];
+                                uint8_t iv2 = ib & 0x7F;
+                                if (iv2 >= SW1_INSTRUMENT_MIN && iv2 <= SW1_INSTRUMENT_MAX)
+                                    iv_list.push_back(iv2);
+                                if (ib & 0x80 && ui < up.size()) {
+                                    uint8_t fx = up[ui++];
+                                    if (fx > 0 && fx < SW1_SMALLFX_MIN && ui < up.size()) ui++;
+                                }
+                            }
+                        }
+                        ptn_instrs_map[ptn_idx] = iv_list;
+                    }
                 }
             }
         }
+
+        auto instrs_in_ptn = [&](int gt2_0based) -> std::vector<uint8_t> {
+            auto it = ptn_instrs_map.find(gt2_0based + 1);
+            return (it != ptn_instrs_map.end()) ? it->second : std::vector<uint8_t>{};
+        };
+
+        int n_pos = 0;
+        for (int si2 = 0; si2 < subtunes; si2++)
+            for (int v = 0; v < 3; v++)
+                n_pos = std::max(n_pos, (int)gt.orderlists[si2].voice[v].length);
+
+        /* Elect voice primaries (most-frequent filter instrument per voice) */
+        std::map<int, std::map<uint8_t,int>> voice_instr_count;
+        for (int pos_idx = 0; pos_idx < n_pos; pos_idx++) {
+            for (int v = 0; v < 3; v++) {
+                for (int si2 = 0; si2 < subtunes; si2++) {
+                    const sng_orderlist& ol = gt.orderlists[si2].voice[v];
+                    if (pos_idx >= ol.length) continue;
+                    uint8_t entry = ol.data[pos_idx];
+                    if (entry == SW1_SEQUENCE_LOOPSONG) break;
+                    if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
+                    for (uint8_t iv : instrs_in_ptn((int)entry))
+                        if (instr_has_filter_fn(iv)) voice_instr_count[v][iv]++;
+                }
+            }
+        }
+        uint8_t voice_primary[3] = {0,0,0};
+        for (int v = 0; v < 3; v++) {
+            int best = 0;
+            for (auto& [iv, cnt] : voice_instr_count[v])
+                if (cnt > best) { best = cnt; voice_primary[v] = iv; }
+        }
+
+        /* Compute per-position designated instrument and its mask.
+         * Collect distinct simultaneous masks for the voice-1 primary only.
+         * Voices 2 and 3 never act as designated filter setters; if voice 1
+         * has no filter instrument at a position the filter simply retains
+         * its last written value (as in SID-Wizard hardware behaviour). */
+        std::map<uint8_t, std::set<uint8_t>> instr_masks; /* iv -> set of masks needed */
+        {
+            uint8_t prim1 = voice_primary[0]; /* voice-1 primary only */
+            for (int pos_idx = 0; pos_idx < n_pos; pos_idx++) {
+                if (!prim1) break;
+                /* Simultaneous filter mask */
+                uint8_t sim_mask = 0;
+                for (int v = 0; v < 3; v++) {
+                    for (int si2 = 0; si2 < subtunes; si2++) {
+                        const sng_orderlist& ol = gt.orderlists[si2].voice[v];
+                        if (pos_idx >= ol.length) continue;
+                        uint8_t entry = ol.data[pos_idx];
+                        if (entry == SW1_SEQUENCE_LOOPSONG) break;
+                        if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
+                        for (uint8_t iv : instrs_in_ptn((int)entry))
+                            if (instr_has_filter_fn(iv)) { sim_mask |= (uint8_t)(1u<<v); break; }
+                    }
+                }
+                if (!sim_mask) continue;
+                /* Check voice 1 for the primary instrument */
+                for (int si2 = 0; si2 < subtunes; si2++) {
+                    const sng_orderlist& ol = gt.orderlists[si2].voice[0];
+                    if (pos_idx >= ol.length) continue;
+                    uint8_t entry = ol.data[pos_idx];
+                    if (entry == SW1_SEQUENCE_LOOPSONG) break;
+                    if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
+                    for (uint8_t iv : instrs_in_ptn((int)entry)) {
+                        if (iv == prim1 && instr_has_filter_fn(iv)) {
+                            instr_masks[prim1].insert(sim_mask);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* For each designated instrument, determine the base mask (fewest channels —
+         * the most restrictive mask, to avoid over-filtering by default) and create
+         * clones for each other distinct mask. */
+        for (auto& [iv, masks] : instr_masks) {
+            /* Use the smallest (most restrictive) mask as the base instrument.
+             * std::set iterates in sorted order so *masks.begin() is the smallest. */
+            uint8_t base_mask = masks.empty() ? 0x01 : *masks.begin();
+
+            filter_voice_mask[iv - 1] = base_mask;
+            filter_instr_clone[std::make_pair(iv, base_mask)] = (int)(iv - 1);
+
+            /* Create a GT2 instrument clone for each other distinct mask */
+            for (uint8_t m : masks) {
+                if (m == base_mask) continue;
+                int new_idx = (int)gt.instruments.size();
+                gt.instruments.push_back(gt.instruments[iv - 1]);
+                filter_instr_clone[std::make_pair(iv, m)] = new_idx;
+                printf("  Clone inst %d '%.8s' -> GT2 inst %d for filter mask 0x%02X\n",
+                       iv, swm.instruments[iv-1].name, new_idx + 1, m);
+            }
+        }
+
+        printf("  Filter voice masks per instrument:\n");
+        for (int i = 0; i < swm.header.instrument_count; i++)
+            if (filter_voice_mask[i])
+                printf("    Inst %d '%.8s': mask=0x%02X\n",
+                       i+1, swm.instruments[i].name, filter_voice_mask[i]);
+
+        /* Store per-position designated instrument and required mask for the
+         * post-processing pass that remaps pattern instrument references.
+         * Only the voice-1 primary is ever designated — voices 2 and 3 are
+         * never the designated setter; if voice 1 has no filter instrument
+         * at a position the filter simply retains its last value. */
+        pos_filter_info.resize(n_pos);
+        for (int pos_idx = 0; pos_idx < n_pos; pos_idx++) {
+            uint8_t sim_mask = 0;
+            for (int v = 0; v < 3; v++) {
+                for (int si2 = 0; si2 < subtunes; si2++) {
+                    const sng_orderlist& ol = gt.orderlists[si2].voice[v];
+                    if (pos_idx >= ol.length) continue;
+                    uint8_t entry = ol.data[pos_idx];
+                    if (entry == SW1_SEQUENCE_LOOPSONG) break;
+                    if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
+                    for (uint8_t iv2 : instrs_in_ptn((int)entry))
+                        if (instr_has_filter_fn(iv2)) { sim_mask |= (uint8_t)(1u<<v); break; }
+                }
+            }
+            /* Only designate voice-1 primary */
+            uint8_t designated = 0;
+            uint8_t prim = voice_primary[0]; /* voice 1 only */
+            if (prim && sim_mask) {
+                for (int si2 = 0; si2 < subtunes; si2++) {
+                    const sng_orderlist& ol = gt.orderlists[si2].voice[0];
+                    if (pos_idx >= ol.length) continue;
+                    uint8_t entry = ol.data[pos_idx];
+                    if (entry == SW1_SEQUENCE_LOOPSONG) break;
+                    if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
+                    for (uint8_t iv2 : instrs_in_ptn((int)entry))
+                        if (iv2 == prim && instr_has_filter_fn(iv2)) { designated = prim; break; }
+                    if (designated) break;
+                }
+            }
+            pos_filter_info[pos_idx] = {designated, sim_mask};
+        }
     }
 
-    /* Patch pattern instrument references if any duplicates were created */
-    bool duplicated = ((int)gt.instruments.size() > swm.header.instrument_count);
+    /* Tables (wave, pulse, filter rebuilt from instruments, now with voice assignments) */
+    /* Extend sw_instr to cover any duplicated entries (they share the same SW source) */
+    std::vector<SW_Instrument> sw_instr_ext = swm.instruments;
+    while ((int)sw_instr_ext.size() < (int)gt.instruments.size())
+        sw_instr_ext.push_back(sw_instr_ext.back());
 
     /* Pre-allocate wave table with maximum capacity (255 entries) so that
-     * CreateArpInstrument can safely append chord-arp entries to it after
+     * GetOrCreateArpWtPos can safely append chord-arp entries to it after
      * ReconstructTables fills the initial instrument wave table data. */
     gt.wavetable.left  = new uint8_t[255]();
     gt.wavetable.right = new uint8_t[255]();
     gt.wavetable.length = 0;
 
-    /* Tables (wave, pulse, filter rebuilt from instruments, now with voice assignments) */
-    /* Extend sw_instr to cover any duplicated entries (they share the same SW source) */
-    std::vector<SW_Instrument> sw_instr_ext = swm.instruments;
-    while ((int)sw_instr_ext.size() < (int)gt.instruments.size()) {
-        /* Find which original instrument this duplicate came from */
-        /* Duplicates are copies of existing instruments - the voice_assignments tell us
-         * how many copies there are per original instrument.                           */
-        /* Safe: just repeat the last original instrument (the correct data is already
-         * in gt.instruments from the copy above; ReconstructTables uses sw_instr_ext
-         * only for table bytes which are the same for all voice-copies).              */
-        sw_instr_ext.push_back(sw_instr_ext.back());
+    /* Extend filter_voice_mask to cover cloned instrument entries.
+     * For clones created for distinct masks, look up their mask from filter_instr_clone. */
+    std::vector<uint8_t> filter_voice_mask_ext = filter_voice_mask;
+    /* Clones were appended after the base instruments; find their masks */
+    for (auto& [key, gt_idx] : filter_instr_clone) {
+        uint8_t sw_num = key.first;
+        uint8_t mask   = key.second;
+        if (gt_idx >= (int)filter_voice_mask_ext.size())
+            filter_voice_mask_ext.resize(gt_idx + 1, 0);
+        filter_voice_mask_ext[gt_idx] = mask;
+        (void)sw_num;
     }
+    while ((int)filter_voice_mask_ext.size() < (int)gt.instruments.size())
+        filter_voice_mask_ext.push_back(0);
 
+    /* Extend voice_assignments to cover any cloned instrument entries.
+     * Clones share the same voice routing as their source instrument. */
+    while ((int)voice_assignments.size() < (int)gt.instruments.size())
+        voice_assignments.push_back(0);
+
+    printf("  Calling ReconstructTables: %d instruments, voice_assignments.size()=%d, filter_ext.size()=%d\n",
+           (int)gt.instruments.size(), (int)voice_assignments.size(),
+           (int)filter_voice_mask_ext.size());
     ReconstructTables(sw_instr_ext, gt.instruments, voice_assignments,
+                      filter_voice_mask_ext,
+                      swm.chords.empty() ? nullptr : &swm.chords,
                       gt.wavetable, gt.pulsetable, gt.filtertable);
+
+    /*---------------------------------------------------------
+     * Post-processing: remap filter instrument clones in patterns.
+     *---------------------------------------------------------*/
+    printf("  Post-processing: gt.patterns.size()=%d gt.instruments.size()=%d\n",
+           (int)gt.patterns.size(), (int)gt.instruments.size());
+    if (!filter_instr_clone.empty() && !pos_filter_info.empty()) {
+        auto base_gt_idx = [&](uint8_t sw_iv) -> int { return (int)(sw_iv - 1); };
+        std::map<std::pair<int,uint8_t>, int> ptn_clone_cache;
+
+        for (int si2 = 0; si2 < subtunes; si2++) {
+            sng_orderlist& ol = gt.orderlists[si2].voice[0];
+            for (int e = 0; e < ol.length; e++) {
+                uint8_t entry = ol.data[e];
+                if (entry == SW1_SEQUENCE_LOOPSONG) break;
+                if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
+
+                int pos_idx = e;
+                if (pos_idx >= (int)pos_filter_info.size()) continue;
+
+                uint8_t desig_iv  = pos_filter_info[pos_idx].designated_iv;
+                uint8_t need_mask = pos_filter_info[pos_idx].sim_mask;
+                if (!desig_iv || !need_mask) continue;
+
+                auto clone_it = filter_instr_clone.find(std::make_pair(desig_iv, need_mask));
+                if (clone_it == filter_instr_clone.end()) continue;
+
+                int clone_gt_idx = clone_it->second;
+                int base_idx     = base_gt_idx(desig_iv);
+                if (clone_gt_idx == base_idx) continue;
+
+                int orig_ptn_idx = (int)entry;
+                /* Bounds check: orig_ptn_idx must be a valid pattern */
+                if (orig_ptn_idx < 0 || orig_ptn_idx >= (int)gt.patterns.size()) continue;
+
+                /* Check if this pattern is also used at positions needing a different mask */
+                bool need_clone = false;
+                for (int e2 = 0; e2 < ol.length && !need_clone; e2++) {
+                    if (e2 == e) continue;
+                    if (ol.data[e2] != entry) continue;
+                    if (e2 >= (int)pos_filter_info.size()) continue;
+                    if (pos_filter_info[e2].sim_mask != need_mask) need_clone = true;
+                }
+
+                int target_ptn_idx = orig_ptn_idx;
+                if (need_clone) {
+                    auto pc_key = std::make_pair(orig_ptn_idx, need_mask);
+                    auto pc_it  = ptn_clone_cache.find(pc_key);
+                    if (pc_it != ptn_clone_cache.end()) {
+                        target_ptn_idx = pc_it->second;
+                    } else {
+                        /* Copy-then-push to avoid self-reference invalidation */
+                        sng_pattern ptn_copy = gt.patterns[orig_ptn_idx];
+                        target_ptn_idx = (int)gt.patterns.size();
+                        gt.patterns.push_back(ptn_copy);
+                        ptn_clone_cache[pc_key] = target_ptn_idx;
+                        printf("  Cloned GT2 pattern %d -> %d for filter mask 0x%02X\n",
+                               orig_ptn_idx + 1, target_ptn_idx + 1, need_mask);
+                    }
+                }
+
+                /* Bounds check on target pattern */
+                if (target_ptn_idx < 0 || target_ptn_idx >= (int)gt.patterns.size()) continue;
+
+                /* Remap instrument rows */
+                sng_pattern& ptn = gt.patterns[target_ptn_idx];
+                if (!ptn.data || ptn.rows == 0) continue;
+                uint8_t old_gt_instr = (uint8_t)(base_idx + 1);
+                uint8_t new_gt_instr = (uint8_t)(clone_gt_idx + 1);
+                for (int r = 0; r < ptn.rows; r++) {
+                    if (ptn.data[r].instrument == old_gt_instr)
+                        ptn.data[r].instrument = new_gt_instr;
+                }
+
+                /* Update orderlist — only if within uint8_t range */
+                if (target_ptn_idx <= 0xFF)
+                    ol.data[e] = (uint8_t)target_ptn_idx;
+            }
+        }
+    }
 
     /*---------------------------------------------------------
      * Speedtable + Tempo
@@ -1589,7 +2033,7 @@ void Convert(const SWMFile& swm, GT2File& gt) {
 
     /* Patterns (SWM numbering starts at 1, GT2 from 0) */
     gt.patterns.resize(swm.header.pattern_count);
-    std::map<std::pair<int,int>,int> arp_cache;
+    std::map<int,uint8_t> arp_cache;
 
     /* Per-voice active instrument state, carried across pattern boundaries.
      * Indexed [subtune * 3 + voice].  Each entry is the SW instrument number
