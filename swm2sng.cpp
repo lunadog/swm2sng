@@ -257,30 +257,98 @@ void LoadSWM(const char* path, SWMFile& swm) {
                i + 1, seq.data.size(), seq.restart_pos);
     }
 
+    /* Save position immediately after sequences = start of pattern block.
+     * The backwards instrument walk below uses fseek and corrupts the file
+     * position; we must restore it before starting pattern parsing. */
+    long pattern_block_start = ftell(f);
+
+    /*---------------------------------------------------------
+     * Compute instrument block start before parsing patterns.
+     *
+     * Per packdepack.inc and Hermit's guidance, the SWM pattern
+     * SIZE byte encodes the UNCOMPRESSED pattern size, not the
+     * packed byte count, so it cannot be used as a back-pointer.
+     * The only reliable parse direction is FORWARD from the pattern
+     * block start with the instrument block start as a hard stop.
+     *
+     * The instrument block start is derived by parsing instruments
+     * BACKWARDS from the known end of the file:
+     *   file_end - subtune_tempos - tempo_table - chord_table
+     *            = end of instrument block
+     * Then each instrument (params + table + name) is stepped back
+     * using the size-marker byte stored just before the name.
+     *
+     * Instrument layout (forward):
+     *   [16 params][variable table][size_marker][8-byte name]
+     * The size_marker value satisfies: total_instr_bytes = size_marker + 9.
+     *---------------------------------------------------------*/
+    long instr_block_start;
+    std::vector<int> instr_sm; /* size_marker values from backwards walk */
+    {
+        int subtune_tempo_bytes = subtunes * 2;
+        long instr_block_end = filesize
+                               - subtune_tempo_bytes
+                               - swm.header.tempotable_length
+                               - swm.header.chordtable_length;
+
+        /* Walk instruments backwards from instr_block_end.
+         * Store each sm value so forward reading can use exact table lengths. */
+        instr_sm.resize(swm.header.instrument_count, 0);
+        long pos_back = instr_block_end;
+        for (int i = swm.header.instrument_count - 1; i >= 0; i--) {
+            /* size_marker is 1 byte before the 8-byte name */
+            long name_end_abs  = pos_back;
+            long size_marker_abs = name_end_abs - 8 - 1; /* -8 name, -1 marker */
+            if (size_marker_abs < headerOffset)
+                die("Instrument block underflows file header");
+            fseek(f, size_marker_abs, SEEK_SET);
+            int sm = fgetc(f);
+            if (sm == EOF) die("Unexpected EOF reading instrument size marker");
+            instr_sm[i] = sm;
+            long instr_total = (long)sm + 9; /* params(16) + table(sm-15) + name(8) */
+            pos_back = name_end_abs - instr_total;
+        }
+        instr_block_start = pos_back;
+        printf("  Instrument block: [%ld..%ld]\n", instr_block_start, instr_block_end - 1);
+    }
+
     /*---------------------------------------------------------
      * Read pattern blocks
      *
      * Each block: [packed row data...][SIZE byte][LENGTH byte]
      *
-     * SIZE byte  = the stored (unpacked) byte count; its value
-     *              is NOT necessarily equal to its file position.
+     * SIZE byte  = the stored (unpacked) byte count (NOT the
+     *              packed byte count; used internally by SID-Wizard
+     *              to depack into fixed-size uncompressed buffers).
      * LENGTH byte = number of pattern rows.
      *
-     * Detection algorithm (the critical fix):
-     *   Parse rows one at a time.  After every complete row,
-     *   peek ONE byte past the current read position.
-     *   If that byte equals rows_parsed, we have found the
-     *   LENGTH byte; the byte immediately before it is SIZE.
+     * Detection algorithm:
+     *   Parse rows forward one at a time.  After each complete row,
+     *   peek at the two bytes at the current file position:
+     *     peek_size = data[pos]
+     *     peek_len  = data[pos+1]
+     *   If peek_len == rows_parsed (and rows > 0), this is likely
+     *   the [SIZE][LENGTH] terminator.  To reject false positives
+     *   where an instrument byte accidentally equals rows_parsed,
+     *   also require:
+     *     0 <= (peek_size - bytes_consumed) <= 32
+     *   which is true for all real terminators observed across
+     *   multiple SWM files (delta ranges from 0 to ~27).
+     *   Additionally, pos+2 must not exceed instr_block_start
+     *   (the hard stop computed above).
      *
      * Row encoding:
      *   0x70..0x77  -> (byte - 0x70 + 2) rest rows
      *   0x7E        -> 1 rest row
      *   other < 0x80 -> 1 row (note or special), no extra bytes
      *   >= 0x80     -> 1 note row; instrument byte follows
-     *     instr bit7=1 -> FX byte follows
-     *       FX < SW1_SMALLFX_MIN -> parameter byte follows
+     *     instr bit7=1 -> FX byte follows; FX below SW1_SMALLFX_MIN means parameter byte follows
      *---------------------------------------------------------*/
     swm.patterns.resize(swm.header.pattern_count + 1);
+
+    /* Restore file position to start of pattern block (the backwards instrument
+     * walk used fseek internally, leaving the file pointer in the wrong place). */
+    fseek(f, pattern_block_start, SEEK_SET);
 
     for (int pi = 1; pi <= swm.header.pattern_count; pi++) {
         SW_Pattern& ptn = swm.patterns[pi];
@@ -292,6 +360,7 @@ void LoadSWM(const char* path, SWMFile& swm) {
 
         /* Safety: each pattern can't be larger than some sane bound. */
         const int MAX_BLOCK = 4096;
+        long ptn_start = ftell(f); /* used for SIZE plausibility check */
 
         for (int guard = 0; guard < MAX_BLOCK && !found; guard++) {
             /* Before reading the next row, peek ahead.
@@ -314,8 +383,15 @@ void LoadSWM(const char* path, SWMFile& swm) {
             if (peek_len  == EOF) die("Unexpected EOF seeking pattern length");
             fseek(f, pos, SEEK_SET);  /* rewind both bytes */
 
-            /* If peek_len == rows && rows > 0: end of block found */
-            if (rows > 0 && (uint8_t)peek_len == (uint8_t)rows) {
+            /* If peek_len == rows && rows > 0: end of block found.
+             * Guard 1: SIZE plausibility — delta in [0..32] rejects false
+             *          positives where an instrument byte equals rows_parsed.
+             * Guard 2: pos+2 must not exceed instr_block_start (hard stop). */
+            long bytes_consumed = ftell(f) - ptn_start;
+            if (rows > 0 && (uint8_t)peek_len == (uint8_t)rows
+                && (long)(uint8_t)peek_size - bytes_consumed >= 0
+                && (long)(uint8_t)peek_size - bytes_consumed <= 32
+                && ftell(f) + 2 <= instr_block_start) {
                 /* Consume SIZE and LENGTH bytes */
                 ptn.size_byte = (uint8_t)fgetc(f);
                 ptn.length    = (uint8_t)fgetc(f);
@@ -364,10 +440,16 @@ void LoadSWM(const char* path, SWMFile& swm) {
 
     /*---------------------------------------------------------
      * Read instruments
+     * Seek to the pre-computed instrument block start for robustness
+     * (insulates against any residual off-by-one in pattern parsing).
      * [SW1_INSTRUMENT_PARAMSIZE param bytes]
      * [table bytes; last byte encodes total instrument size]
      * [SW1_INSTRUMENT_NAMESIZE name bytes]
+     * Table length is computed from the sm value gathered during the backwards
+     * walk: table_len = sm - 15.  The in-band marker check (b == 16+size-1) is
+     * unreliable because table data can accidentally match the check value.
      *---------------------------------------------------------*/
+    fseek(f, instr_block_start, SEEK_SET);
     swm.instruments.resize(swm.header.instrument_count);
     for (int i = 0; i < swm.header.instrument_count; i++) {
         SW_Instrument& inst = swm.instruments[i];
@@ -375,18 +457,14 @@ void LoadSWM(const char* path, SWMFile& swm) {
                 != SW1_INSTRUMENT_PARAMSIZE)
             die("Failed to read instrument params");
 
-        inst.tables.clear();
-        for (;;) {
-            uint8_t c = read8(f);
-            inst.tables.push_back(c);
-            /* The last byte of the table section encodes total instrument size:
-             * value = SW1_INSTRUMENT_PARAMSIZE + table_size - 1              */
-            if (c == (uint8_t)(SW1_INSTRUMENT_PARAMSIZE
-                               + (int)inst.tables.size() - 1))
-                break;
-            if (inst.tables.size() > 512)
-                die("Instrument table overflow");
-        }
+        int sm = instr_sm[i];
+        int table_len = sm - 15; /* exact table byte count including size-marker byte */
+        if (table_len < 1 || table_len > 512)
+            die("Instrument table length out of range");
+        inst.tables.resize(table_len);
+        if ((int)fread(inst.tables.data(), 1, table_len, f) != table_len)
+            die("Failed to read instrument table");
+
         if (fread(inst.name, 1, SW1_INSTRUMENT_NAMESIZE, f)
                 != SW1_INSTRUMENT_NAMESIZE)
             die("Failed to read instrument name");
@@ -1424,7 +1502,11 @@ static std::pair<uint8_t,uint8_t> SWvibToGTvib(uint8_t SWvibr, uint8_t Dpitch) {
 static void ConvertInstrument(const SW_Instrument& si,
                               sng_instrument&      gi,
                               SpeedTableBuilder&   spdBuilder) {
-    /* ADSR — direct 1:1 mapping */
+    /* ADSR — direct 1:1 mapping.
+     * params.ad (byte[3]) = note-start Attack/Decay.
+     * params.sr (byte[4]) = note-start Sustain/Release.
+     * (params.hr_ad/hr_sr at bytes[1][2] are the hard-restart ADSR values;
+     *  GT2 has no separate HR-ADSR so those are not mapped.) */
     gi.ad = si.params.ad;
     gi.sr = si.params.sr;
 
@@ -1621,218 +1703,71 @@ void Convert(const SWMFile& swm, GT2File& gt) {
     /*---------------------------------------------------------
      * Per-instrument filter voice mask.
      *
-     * SID-Wizard's SID filter is global hardware — whichever instrument
-     * last writes to the filter registers wins.  In GT2, multiple
-     * simultaneously-active filter table entries cancel each other, so
-     * at any given orderlist position only ONE instrument should be the
-     * designated filter setter.
+     * Hermit (SID-Wizard author): "If all 3 channels control the filter
+     * at the same time, the leftmost channel has priority.  But if then
+     * any new filter-controlling instrument comes on any channel, it
+     * takes over priority."
      *
-     * Rule: for each voice, the filter instrument that appears most
-     * frequently on that voice is elected "voice primary".  At each
-     * orderlist position the voice-1 primary is designated (fallback
-     * to voice 2, then 3).  The designated instrument gets the
-     * simultaneous channel mask for that position.
-     *
-     * When the same instrument plays at positions with DIFFERENT
-     * simultaneous masks (e.g. sometimes all-3-channels, sometimes
-     * ch1-only), a copy of the instrument is created for each distinct
-     * mask.  The orderlist entry pointing to the original instrument
-     * at that position is redirected to the appropriate copy.
+     * Each filter instrument gets a mask equal to the union of voice bits
+     * it plays on.  This way each instrument writes routing only for its
+     * own channel(s).  Whichever instrument most recently triggered a note
+     * has set the filter routing last ("takes over priority").
+     * No cloning is needed.
      *---------------------------------------------------------*/
-
-    /* Declare outside the block so it is visible at ReconstructTables call */
     std::vector<uint8_t> filter_voice_mask(swm.header.instrument_count, 0);
-
-    struct PosFilterInfo { uint8_t designated_iv; uint8_t sim_mask; };
-    std::vector<PosFilterInfo> pos_filter_info; /* per orderlist position */
-
-    /* Maps (sw_instr_1based, channel_mask) -> GT2 instrument index (0-based). */
-    std::map<std::pair<uint8_t,uint8_t>, int> filter_instr_clone;
-
     {
-        auto instr_has_filter_fn = [&](int iv) -> bool {
-            if (iv < 1 || iv > swm.header.instrument_count) return false;
-            const SW_Instrument& si2 = swm.instruments[iv - 1];
-            uint8_t foff = (si2.params.filtertb_index >= SW1_INSTRUMENT_PARAMSIZE)
-                           ? si2.params.filtertb_index - SW1_INSTRUMENT_PARAMSIZE
-                           : (uint8_t)si2.tables.size();
-            return foff < (uint8_t)(si2.tables.size() - 1);
-        };
-
-        /* Build per-pattern instrument list */
-        std::map<int, std::vector<uint8_t>> ptn_instrs_map;
-        for (int si2 = 0; si2 < subtunes; si2++) {
-            for (int v = 0; v < 3; v++) {
+        /* Build voice mask for each instrument from orderlists + patterns */
+        std::map<int,uint8_t> ivm; /* sw_instr_1based -> voice_bits */
+        for (int v = 0; v < 3; v++) {
+            uint8_t vbit = (uint8_t)(1u << v);
+            for (int si2 = 0; si2 < subtunes; si2++) {
                 const sng_orderlist& ol = gt.orderlists[si2].voice[v];
                 for (int e = 0; e < ol.length; e++) {
                     uint8_t entry = ol.data[e];
                     if (entry == SW1_SEQUENCE_LOOPSONG) break;
                     if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
-                    int ptn_idx = (int)entry + 1;
-                    if (ptn_instrs_map.count(ptn_idx)) continue;
-                    if (ptn_idx >= 1 && ptn_idx <= swm.header.pattern_count) {
-                        std::vector<uint8_t> iv_list;
-                        const auto& up = UnpackPattern(swm.patterns[ptn_idx].packed);
-                        for (size_t ui = 0; ui < up.size(); ) {
-                            uint8_t nb = up[ui++];
-                            if (nb & 0x80) {
-                                if (ui >= up.size()) break;
-                                uint8_t ib = up[ui++];
-                                uint8_t iv2 = ib & 0x7F;
-                                if (iv2 >= SW1_INSTRUMENT_MIN && iv2 <= SW1_INSTRUMENT_MAX)
-                                    iv_list.push_back(iv2);
-                                if (ib & 0x80 && ui < up.size()) {
-                                    uint8_t fx = up[ui++];
-                                    if (fx > 0 && fx < SW1_SMALLFX_MIN && ui < up.size()) ui++;
-                                }
+                    int sw_ptn = (int)entry + 1;
+                    if (sw_ptn < 1 || sw_ptn > swm.header.pattern_count) continue;
+                    const auto& up = UnpackPattern(swm.patterns[sw_ptn].packed);
+                    for (size_t ui = 0; ui < up.size(); ) {
+                        uint8_t nb = up[ui++];
+                        if (nb & 0x80) {
+                            if (ui >= up.size()) break;
+                            uint8_t ib = up[ui++];
+                            uint8_t iv2 = ib & 0x7F;
+                            if (iv2 >= SW1_INSTRUMENT_MIN && iv2 <= SW1_INSTRUMENT_MAX)
+                                ivm[iv2] |= vbit;
+                            if (ib & 0x80 && ui < up.size()) {
+                                uint8_t fx = up[ui++];
+                                if (fx > 0 && fx < SW1_SMALLFX_MIN && ui < up.size()) ui++;
                             }
                         }
-                        ptn_instrs_map[ptn_idx] = iv_list;
                     }
                 }
             }
         }
-
-        auto instrs_in_ptn = [&](int gt2_0based) -> std::vector<uint8_t> {
-            auto it = ptn_instrs_map.find(gt2_0based + 1);
-            return (it != ptn_instrs_map.end()) ? it->second : std::vector<uint8_t>{};
-        };
-
-        int n_pos = 0;
-        for (int si2 = 0; si2 < subtunes; si2++)
-            for (int v = 0; v < 3; v++)
-                n_pos = std::max(n_pos, (int)gt.orderlists[si2].voice[v].length);
-
-        /* Elect voice primaries (most-frequent filter instrument per voice) */
-        std::map<int, std::map<uint8_t,int>> voice_instr_count;
-        for (int pos_idx = 0; pos_idx < n_pos; pos_idx++) {
-            for (int v = 0; v < 3; v++) {
-                for (int si2 = 0; si2 < subtunes; si2++) {
-                    const sng_orderlist& ol = gt.orderlists[si2].voice[v];
-                    if (pos_idx >= ol.length) continue;
-                    uint8_t entry = ol.data[pos_idx];
-                    if (entry == SW1_SEQUENCE_LOOPSONG) break;
-                    if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
-                    for (uint8_t iv : instrs_in_ptn((int)entry))
-                        if (instr_has_filter_fn(iv)) voice_instr_count[v][iv]++;
-                }
+        for (int i = 0; i < swm.header.instrument_count; i++) {
+            const SW_Instrument& si2 = swm.instruments[i];
+            uint8_t foff = (si2.params.filtertb_index >= SW1_INSTRUMENT_PARAMSIZE)
+                           ? si2.params.filtertb_index - SW1_INSTRUMENT_PARAMSIZE
+                           : (uint8_t)si2.tables.size();
+            bool has_filter2 = foff < (uint8_t)(si2.tables.size() - 1);
+            if (has_filter2) {
+                uint8_t vm = ivm.count(i+1) ? ivm[i+1] : 0x07;
+                if (!vm) vm = 0x07;
+                filter_voice_mask[i] = vm;
+                printf("    Inst %d '%.8s': filter mask=0x%02X\n",
+                       i+1, swm.instruments[i].name, vm);
             }
-        }
-        uint8_t voice_primary[3] = {0,0,0};
-        for (int v = 0; v < 3; v++) {
-            int best = 0;
-            for (auto& [iv, cnt] : voice_instr_count[v])
-                if (cnt > best) { best = cnt; voice_primary[v] = iv; }
-        }
-
-        /* Compute per-position designated instrument and its mask.
-         * Collect distinct simultaneous masks for the voice-1 primary only.
-         * Voices 2 and 3 never act as designated filter setters; if voice 1
-         * has no filter instrument at a position the filter simply retains
-         * its last written value (as in SID-Wizard hardware behaviour). */
-        std::map<uint8_t, std::set<uint8_t>> instr_masks; /* iv -> set of masks needed */
-        {
-            uint8_t prim1 = voice_primary[0]; /* voice-1 primary only */
-            for (int pos_idx = 0; pos_idx < n_pos; pos_idx++) {
-                if (!prim1) break;
-                /* Simultaneous filter mask */
-                uint8_t sim_mask = 0;
-                for (int v = 0; v < 3; v++) {
-                    for (int si2 = 0; si2 < subtunes; si2++) {
-                        const sng_orderlist& ol = gt.orderlists[si2].voice[v];
-                        if (pos_idx >= ol.length) continue;
-                        uint8_t entry = ol.data[pos_idx];
-                        if (entry == SW1_SEQUENCE_LOOPSONG) break;
-                        if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
-                        for (uint8_t iv : instrs_in_ptn((int)entry))
-                            if (instr_has_filter_fn(iv)) { sim_mask |= (uint8_t)(1u<<v); break; }
-                    }
-                }
-                if (!sim_mask) continue;
-                /* Check voice 1 for the primary instrument */
-                for (int si2 = 0; si2 < subtunes; si2++) {
-                    const sng_orderlist& ol = gt.orderlists[si2].voice[0];
-                    if (pos_idx >= ol.length) continue;
-                    uint8_t entry = ol.data[pos_idx];
-                    if (entry == SW1_SEQUENCE_LOOPSONG) break;
-                    if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
-                    for (uint8_t iv : instrs_in_ptn((int)entry)) {
-                        if (iv == prim1 && instr_has_filter_fn(iv)) {
-                            instr_masks[prim1].insert(sim_mask);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        /* For each designated instrument, determine the base mask (fewest channels —
-         * the most restrictive mask, to avoid over-filtering by default) and create
-         * clones for each other distinct mask. */
-        for (auto& [iv, masks] : instr_masks) {
-            /* Use the smallest (most restrictive) mask as the base instrument.
-             * std::set iterates in sorted order so *masks.begin() is the smallest. */
-            uint8_t base_mask = masks.empty() ? 0x01 : *masks.begin();
-
-            filter_voice_mask[iv - 1] = base_mask;
-            filter_instr_clone[std::make_pair(iv, base_mask)] = (int)(iv - 1);
-
-            /* Create a GT2 instrument clone for each other distinct mask */
-            for (uint8_t m : masks) {
-                if (m == base_mask) continue;
-                int new_idx = (int)gt.instruments.size();
-                gt.instruments.push_back(gt.instruments[iv - 1]);
-                filter_instr_clone[std::make_pair(iv, m)] = new_idx;
-                printf("  Clone inst %d '%.8s' -> GT2 inst %d for filter mask 0x%02X\n",
-                       iv, swm.instruments[iv-1].name, new_idx + 1, m);
-            }
-        }
-
-        printf("  Filter voice masks per instrument:\n");
-        for (int i = 0; i < swm.header.instrument_count; i++)
-            if (filter_voice_mask[i])
-                printf("    Inst %d '%.8s': mask=0x%02X\n",
-                       i+1, swm.instruments[i].name, filter_voice_mask[i]);
-
-        /* Store per-position designated instrument and required mask for the
-         * post-processing pass that remaps pattern instrument references.
-         * Only the voice-1 primary is ever designated — voices 2 and 3 are
-         * never the designated setter; if voice 1 has no filter instrument
-         * at a position the filter simply retains its last value. */
-        pos_filter_info.resize(n_pos);
-        for (int pos_idx = 0; pos_idx < n_pos; pos_idx++) {
-            uint8_t sim_mask = 0;
-            for (int v = 0; v < 3; v++) {
-                for (int si2 = 0; si2 < subtunes; si2++) {
-                    const sng_orderlist& ol = gt.orderlists[si2].voice[v];
-                    if (pos_idx >= ol.length) continue;
-                    uint8_t entry = ol.data[pos_idx];
-                    if (entry == SW1_SEQUENCE_LOOPSONG) break;
-                    if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
-                    for (uint8_t iv2 : instrs_in_ptn((int)entry))
-                        if (instr_has_filter_fn(iv2)) { sim_mask |= (uint8_t)(1u<<v); break; }
-                }
-            }
-            /* Only designate voice-1 primary */
-            uint8_t designated = 0;
-            uint8_t prim = voice_primary[0]; /* voice 1 only */
-            if (prim && sim_mask) {
-                for (int si2 = 0; si2 < subtunes; si2++) {
-                    const sng_orderlist& ol = gt.orderlists[si2].voice[0];
-                    if (pos_idx >= ol.length) continue;
-                    uint8_t entry = ol.data[pos_idx];
-                    if (entry == SW1_SEQUENCE_LOOPSONG) break;
-                    if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
-                    for (uint8_t iv2 : instrs_in_ptn((int)entry))
-                        if (iv2 == prim && instr_has_filter_fn(iv2)) { designated = prim; break; }
-                    if (designated) break;
-                }
-            }
-            pos_filter_info[pos_idx] = {designated, sim_mask};
         }
     }
 
-    /* Tables (wave, pulse, filter rebuilt from instruments, now with voice assignments) */
+    /* No instrument cloning for filter */
+    struct PosFilterInfo { uint8_t designated_iv; uint8_t sim_mask; };
+    std::vector<PosFilterInfo> pos_filter_info;
+    std::map<std::pair<uint8_t,uint8_t>, int> filter_instr_clone;
+
+        /* Tables (wave, pulse, filter rebuilt from instruments, now with voice assignments) */
     /* Extend sw_instr to cover any duplicated entries (they share the same SW source) */
     std::vector<SW_Instrument> sw_instr_ext = swm.instruments;
     while ((int)sw_instr_ext.size() < (int)gt.instruments.size())
