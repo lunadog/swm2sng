@@ -147,7 +147,7 @@ struct GT2File {
  * Forward declarations
  *************************************************************/
 void LoadSWM    (const char* path, SWMFile& swm);
-void Convert     (const SWMFile& swm, GT2File& gt);
+void Convert     (const SWMFile& swm, GT2File& gt, bool filterClone);
 void WriteSNGFile(const char* path, const GT2File& gt);
 void FreeGT2File (GT2File& gt);
 
@@ -156,17 +156,33 @@ void FreeGT2File (GT2File& gt);
  *************************************************************/
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        printf("Usage: swm2sng <input.swm[.prg]> [output.sng]\n");
+        printf("Usage: swm2sng [--no-filter-clone] <input.swm[.prg]> [output.sng]\n");
+        printf("  --no-filter-clone  Use simple per-voice filter mask without instrument\n");
+        printf("                     cloning.  Faster but less accurate filter routing.\n");
         return 1;
     }
-    const char* inPath  = argv[1];
-    const char* outPath = (argc > 2) ? argv[2] : "output.sng";
+
+    bool filterClone = true;
+    int  firstArg    = 1;
+    for (int a = 1; a < argc; a++) {
+        if (strcmp(argv[a], "--no-filter-clone") == 0) {
+            filterClone = false;
+            firstArg = a + 1;
+        }
+    }
+    if (firstArg >= argc) {
+        printf("Error: no input file specified.\n");
+        return 1;
+    }
+
+    const char* inPath  = argv[firstArg];
+    const char* outPath = (firstArg + 1 < argc) ? argv[firstArg + 1] : "output.sng";
 
     SWMFile swm;
     GT2File gt;
 
     LoadSWM(inPath, swm);
-    Convert(swm, gt);
+    Convert(swm, gt, filterClone);
     WriteSNGFile(outPath, gt);
     FreeGT2File(gt);
 
@@ -719,16 +735,18 @@ static uint8_t SWsldToGTspd(uint8_t SWsld, uint8_t Dpitch,
  *   [0x00, arp_val(chord[2])]  step 2  (if non-zero)
  *   [0xFF, self_pos]           loop back to this sequence's start
  *
- * arp_cache maps chord_num → 1-based wave table start position.
+ * arp_cache maps (chord_num, waveform) → 1-based wave table start position.
  * Returns 0 if the wave table is full.
  *************************************************************/
 static uint8_t GetOrCreateArpWtPos(
         int                               chord_num,
         const std::vector<uint8_t>&       chord,
+        uint8_t                           waveform,  /* waveform for first arp entry */
         sng_table&                        wt,
-        std::map<int,uint8_t>&            arp_cache)
+        std::map<std::pair<int,int>,uint8_t>& arp_cache)
 {
-    auto it = arp_cache.find(chord_num);
+    auto cache_key = std::make_pair(chord_num, (int)waveform);
+    auto it = arp_cache.find(cache_key);
     if (it != arp_cache.end())
         return it->second;
 
@@ -751,7 +769,9 @@ static uint8_t GetOrCreateArpWtPos(
 
     uint8_t arp_start = (uint8_t)(wt.length + 1); /* 1-based */
     for (int s = 0; s < n_steps; s++) {
-        wt.left [wt.length] = 0x00;
+        /* Set waveform on every step so the gate stays open and the note
+         * doesn't fade out between arp steps. */
+        wt.left [wt.length] = waveform;
         wt.right[wt.length] = sw_to_gt2_arp(chord[s]);
         wt.length++;
     }
@@ -759,10 +779,10 @@ static uint8_t GetOrCreateArpWtPos(
     wt.right[wt.length] = arp_start;
     wt.length++;
 
-    printf("  Chord %d (%zu steps) -> wave table pos %d\n",
-           chord_num, chord.size(), arp_start);
+    printf("  Chord %d waveform=0x%02X (%zu steps) -> wave table pos %d\n",
+           chord_num, waveform, chord.size(), arp_start);
 
-    arp_cache[chord_num] = arp_start;
+    arp_cache[cache_key] = arp_start;
     return arp_start;
 }
 
@@ -781,10 +801,11 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
                            uint8_t tempo_cmd   = 0,
                            uint8_t tempo_param = 0,
                            const std::vector<std::vector<uint8_t>>* chords      = nullptr,
-                           std::map<int,uint8_t>*                    arp_cache   = nullptr,
+                           std::map<std::pair<int,int>,uint8_t>*     arp_cache   = nullptr,
                            GT2File*                                   gt_file     = nullptr,
                            const std::vector<int8_t>*                 oct_shifts  = nullptr,
-                           uint8_t*                                   inout_instr = nullptr) {
+                           uint8_t*                                   inout_instr = nullptr,
+                           const std::vector<SW_Instrument>*          sw_instruments = nullptr) {
     auto unpacked = UnpackPattern(sw.packed);
 
     gt.rows = sw.length + 1;  /* +1 for GT2's mandatory $FF end row */
@@ -803,6 +824,24 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
      * boundaries (GT2 instruments persist until explicitly changed, just as in
      * SID-Wizard).  Written back to inout_instr at the end of the pattern. */
     uint8_t cur_instr = (inout_instr && *inout_instr) ? *inout_instr : 0;
+
+    /* Returns the first waveform byte from the wave section of sw_instr (1-based).
+     * Used to set the waveform on the first step of chord arp sequences, so the
+     * SID chip plays the correct waveform when an alternate chord is triggered. */
+    auto instrWaveform = [&](uint8_t sw_iv) -> uint8_t {
+        if (!sw_instruments || sw_iv < 1 ||
+                sw_iv > (uint8_t)sw_instruments->size()) return 0x41;
+        const SW_Instrument& si2 = (*sw_instruments)[sw_iv - 1];
+        uint8_t pulse_off = (si2.params.pulsetb_index >= SW1_INSTRUMENT_PARAMSIZE)
+                            ? si2.params.pulsetb_index - SW1_INSTRUMENT_PARAMSIZE
+                            : (uint8_t)si2.tables.size();
+        for (uint8_t t = 0; t + 1 < pulse_off && t + 1 < (uint8_t)si2.tables.size(); t += 3) {
+            uint8_t L = si2.tables[t];
+            if (L == SW1_TABLE_END || L == SW1_TABLE_JUMP) break;
+            if (L != 0x00) return L;
+        }
+        return 0x41; /* default: pulse + gate */
+    };
 
     /* Portamento carry-over.
      * In SID-Wizard, a portamento (slide) FX set on one row continues on every
@@ -908,7 +947,7 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
         if (!hasFX && instrVal == SW1_LEGATO) {
             r.command   = GT2_COMMAND_TONEPORT;
             r.parameter = 0;  /* legato = toneport with speed 0 */
-        } else if (instrVal >= 0x70 && instrVal <= 0x7F) {
+        } else if (instrVal >= SW1_SMALLFX_SETCHORD && instrVal <= (SW1_SMALLFX_SETCHORD | 0x0F)) {
             /* $70..$7F in the instrument column = Set Chord (override default).
              * SW chord numbers in pattern data are 1-based: 0x71 = chord 1,
              * 0x72 = chord 2, etc.  Convert to 0-based index. */
@@ -920,6 +959,7 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
                     uint8_t wt_pos = GetOrCreateArpWtPos(
                                          (int)chord_num,
                                          (*chords)[chord_num],
+                                         instrWaveform(cur_instr),
                                          gt_file->wavetable,
                                          *arp_cache);
                     if (wt_pos != 0) {
@@ -953,7 +993,7 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
             if (fxbase == SW1_SMALLFX_MAINVOL) {
                 r.command   = GT2_COMMAND_VOLUME;
                 r.parameter = fxnybbl;
-            } else if (fxbase == 0x70) {
+            } else if (fxbase == SW1_SMALLFX_SETCHORD) {
                 /* 0x70..0x7F in the FX column = Set Chord.
                  * SW chord numbers are 1-based: 0x71=chord1, 0x72=chord2, etc. */
                 if (fxnybbl > 0) {
@@ -963,6 +1003,7 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
                         uint8_t wt_pos = GetOrCreateArpWtPos(
                                              (int)chord_num,
                                              (*chords)[chord_num],
+                                             instrWaveform(cur_instr),
                                              gt_file->wavetable,
                                              *arp_cache);
                         if (wt_pos != 0) {
@@ -991,6 +1032,7 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
                     uint8_t wt_pos = GetOrCreateArpWtPos(
                                          (int)fxval,
                                          (*chords)[fxval],
+                                         instrWaveform(cur_instr),
                                          gt_file->wavetable,
                                          *arp_cache);
                     if (wt_pos != 0) {
@@ -1119,6 +1161,7 @@ static void SWFilterToGT2Filter(
         const std::vector<uint8_t>& filter_section,
         uint8_t                     voice_mask,
         uint8_t                     initial_ctrl,
+        uint8_t                     filter_abs_start, /* absolute byte from params start */
         std::vector<uint8_t>&       fl_left,
         std::vector<uint8_t>&       fl_right)
 {
@@ -1236,15 +1279,16 @@ static void SWFilterToGT2Filter(
     }
 
     /* Patch any SW_TABLE_JUMP targets.
-     * sw_offset_to_gt2 maps SW filter_section byte offsets to GT2 positions.
-     * The jump right byte we stored is the raw SW byte offset; replace with
-     * the corresponding GT2 1-based table index. */
+     * sw_offset_to_gt2 maps SW filter_section byte offsets (0-based within
+     * filter_section) to GT2 positions.  The raw R stored is an absolute byte
+     * offset from the instrument params start; subtract filter_abs_start first. */
     for (size_t k = gt2_table_start - 1; k < fl_left.size(); k++) {
         if (fl_left[k] == 0xFF && fl_right[k] != 0x00) {
-            uint8_t sw_target = fl_right[k];
-            if (sw_target < sw_offset_to_gt2.size() &&
-                sw_offset_to_gt2[sw_target] != 0) {
-                fl_right[k] = sw_offset_to_gt2[sw_target];
+            uint8_t sw_abs   = fl_right[k]; /* absolute from params start */
+            int     sw_rel   = (int)sw_abs - (int)filter_abs_start;
+            if (sw_rel >= 0 && (size_t)sw_rel < sw_offset_to_gt2.size() &&
+                sw_offset_to_gt2[(size_t)sw_rel] != 0) {
+                fl_right[k] = sw_offset_to_gt2[(size_t)sw_rel];
             } else {
                 fl_right[k] = gt2_table_start; /* fallback: loop to start */
             }
@@ -1289,21 +1333,26 @@ static void ReconstructTables(
         /* ---- Wave table ---- */
         uint8_t wv_start = (uint8_t)(wv_left.size() + 1);
         bool wv_terminated = false;
+        bool wv_has_data   = false;
         for (uint8_t t = 0; t < pulse_offset && t < (uint8_t)tbl.size(); t += 3) {
             uint8_t L = tbl[t];
             uint8_t R = (t + 1 < (uint8_t)tbl.size()) ? tbl[t+1] : 0;
 
             if (L == SW1_TABLE_END) {
-                /* 0xFF in SW = end of table: emit GT2 stop (FF 00) */
-                wv_left.push_back(GT2_TABLE_JUMP);
-                wv_right.push_back(0x00);
+                /* 0xFF in SW = end of table: emit GT2 stop (FF 00) only if there's data */
+                if (wv_has_data) {
+                    wv_left.push_back(GT2_TABLE_JUMP);
+                    wv_right.push_back(0x00);
+                }
                 wv_terminated = true;
                 break;
             }
             if (L == SW1_TABLE_JUMP) {
-                /* 0xFE in SW = loop/jump: R is the SW byte offset (0-based).
+                /* 0xFE in SW = loop/jump: R is the absolute byte offset from the
+                 * start of the instrument params block (byte 0 of the 16-byte params).
+                 * The wave section starts at absolute byte SW1_INSTRUMENT_PARAMSIZE (16).
                  * Convert to a GT2 1-based table position. */
-                uint8_t gt_target = (uint8_t)(wv_start + R / 3);
+                uint8_t gt_target = (uint8_t)(wv_start + (R - SW1_INSTRUMENT_PARAMSIZE) / 3);
                 wv_left.push_back(GT2_TABLE_JUMP);
                 wv_right.push_back(gt_target);
                 wv_terminated = true;
@@ -1324,9 +1373,11 @@ static void ReconstructTables(
                         return sw_off;
                     };
                     for (int s = 0; s < n_steps; s++) {
-                        wv_left.push_back(s == 0 ? L : 0x00);
+                        /* Set waveform on every step to keep gate open */
+                        wv_left.push_back(L);
                         wv_right.push_back(to_gt2_arp(chord[s]));
                     }
+                    wv_has_data = true;
                 }
                 /* The chord must loop continuously: emit a jump back to the start
                  * of this instrument's wave table entries, then stop processing.
@@ -1345,40 +1396,45 @@ static void ReconstructTables(
                 R -= 1;
             wv_left.push_back(L);
             wv_right.push_back(R);
+            wv_has_data = true;
         }
-        /* Only add a loop-back if the SW table had no explicit terminator.
-         * If it ended with 0xFF (stop) we already emitted FF 00.
-         * If it ended with 0xFE (jump) we already emitted the jump.
-         * If it simply ran to the boundary with no terminator, add a loop. */
-        if (!wv_terminated && (uint8_t)wv_left.size() >= wv_start) {
+        /* Only add a loop-back if the SW table had no explicit terminator
+         * and had real data entries. */
+        if (!wv_terminated && wv_has_data) {
             wv_left.push_back(GT2_TABLE_JUMP);
             wv_right.push_back(wv_start);
         }
-        gi.wv = (wv_start <= (uint8_t)wv_left.size()) ? wv_start : 0;
+        gi.wv = wv_has_data ? wv_start : 0;
 
         /* ---- Pulse table ---- */
         uint8_t pl_start = (uint8_t)(pl_left.size() + 1);
         bool pl_terminated = false;
+        bool pl_has_data   = false; /* true once a real (non-stop/jump) entry is added */
         for (uint8_t t = pulse_offset; t < filter_offset && t < (uint8_t)tbl.size(); t += 3) {
             uint8_t L = tbl[t];
             uint8_t R = (t + 1 < (uint8_t)tbl.size()) ? tbl[t+1] : 0;
             if (L == SW1_TABLE_END) {
-                pl_left.push_back(GT2_TABLE_JUMP); pl_right.push_back(0x00);
+                if (pl_has_data) { /* only emit stop if there's something to stop after */
+                    pl_left.push_back(GT2_TABLE_JUMP); pl_right.push_back(0x00);
+                }
                 pl_terminated = true; break;
             }
             if (L == SW1_TABLE_JUMP) {
-                uint8_t gt_target = (uint8_t)(pl_start + (R - pulse_offset) / 3);
+                /* R is the absolute byte offset from the instrument params start.
+                 * Pulse section starts at absolute byte SW1_INSTRUMENT_PARAMSIZE + pulse_offset. */
+                uint8_t gt_target = (uint8_t)(pl_start + (R - (SW1_INSTRUMENT_PARAMSIZE + pulse_offset)) / 3);
                 pl_left.push_back(GT2_TABLE_JUMP); pl_right.push_back(gt_target);
                 pl_terminated = true; break;
             }
             pl_left.push_back(L);
             pl_right.push_back(R);
+            pl_has_data = true;
         }
-        if (!pl_terminated && (uint8_t)pl_left.size() >= pl_start) {
+        if (!pl_terminated && pl_has_data) {
             pl_left.push_back(GT2_TABLE_JUMP);
             pl_right.push_back(0x00);
         }
-        gi.pl = (pl_start <= (uint8_t)pl_left.size()) ? pl_start : 0;
+        gi.pl = pl_has_data ? pl_start : 0;
 
         /* ---- Filter table ---- */
         uint8_t fl_start = (uint8_t)(fl_left.size() + 1);
@@ -1402,8 +1458,11 @@ static void ReconstructTables(
              * A non-zero mask means this instrument owns the filter at some positions;
              * use that exact mask (no fallback). */
             uint8_t fmask = (i < filter_voice_mask.size()) ? filter_voice_mask[i] : 0;
-            if (fmask != 0)
-                SWFilterToGT2Filter(filter_section, fmask, initial_ctrl, fl_left, fl_right);
+            if (fmask != 0) {
+                uint8_t filter_abs_start = (uint8_t)(SW1_INSTRUMENT_PARAMSIZE + filter_offset);
+                SWFilterToGT2Filter(filter_section, fmask, initial_ctrl,
+                                    filter_abs_start, fl_left, fl_right);
+            }
         }
 
         gi.fl = (fl_start <= (uint8_t)fl_left.size()) ? fl_start : 0;
@@ -1568,7 +1627,7 @@ static void ConvertInstrument(const SW_Instrument& si,
 /*************************************************************
  * Convert
  *************************************************************/
-void Convert(const SWMFile& swm, GT2File& gt) {
+void Convert(const SWMFile& swm, GT2File& gt, bool filterClone) {
     const int subtunes = swm.header.sequence_count / 3;
 
     /* Header */
@@ -1708,16 +1767,47 @@ void Convert(const SWMFile& swm, GT2File& gt) {
      * any new filter-controlling instrument comes on any channel, it
      * takes over priority."
      *
-     * Each filter instrument gets a mask equal to the union of voice bits
-     * it plays on.  This way each instrument writes routing only for its
-     * own channel(s).  Whichever instrument most recently triggered a note
-     * has set the filter routing last ("takes over priority").
-     * No cloning is needed.
+     * Two modes selected by the filterClone flag:
+     *
+     * --no-filter-clone (simple):
+     *   Each filter instrument gets mask = union of voice bits it plays on.
+     *   No cloning.  Fast but routing may be imprecise.
+     *
+     * Default (row-level clone mode):
+     *   Simulate the song row by row, tracking which instrument is playing
+     *   on each voice and which has filter priority at every row.
+     *   For each unique (priority_instrument, routing_mask) pair, create a
+     *   GT2 instrument clone with that exact filter table mask.  Clone GT2
+     *   patterns as needed so each pattern row references the right clone.
      *---------------------------------------------------------*/
+
+    /* Helper: does instrument i (0-based) have a filter table? */
+    auto instHasFilter = [&](int i) -> bool {
+        if (i < 0 || i >= swm.header.instrument_count) return false;
+        const SW_Instrument& si2 = swm.instruments[i];
+        uint8_t foff = (si2.params.filtertb_index >= SW1_INSTRUMENT_PARAMSIZE)
+                       ? si2.params.filtertb_index - SW1_INSTRUMENT_PARAMSIZE
+                       : (uint8_t)si2.tables.size();
+        return foff < (uint8_t)(si2.tables.size() - 1);
+    };
+
+    /* filter_voice_mask[i] = GT2 channel routing byte for instrument i (0-based).
+     * 0 = no filter table entry. */
     std::vector<uint8_t> filter_voice_mask(swm.header.instrument_count, 0);
-    {
-        /* Build voice mask for each instrument from orderlists + patterns */
-        std::map<int,uint8_t> ivm; /* sw_instr_1based -> voice_bits */
+
+    /* filter_instr_clone[(sw_1based, mask)] = GT2 instrument index (0-based).
+     * Populated only in clone mode. */
+    std::map<std::pair<uint8_t,uint8_t>, int> filter_instr_clone;
+
+    /* FilterCtx and row_ctx are populated in clone mode and consumed by
+     * the post-processing pass below.  Declared here so both sections
+     * can see them regardless of which branch runs. */
+    struct FilterCtx { uint8_t priority_iv; uint8_t mask; };
+    std::map<std::pair<int,int>, FilterCtx> row_ctx;
+
+    if (!filterClone) {
+        /* ---- Simple mode: per-voice mask from orderlist scan ---- */
+        std::map<int,uint8_t> ivm;
         for (int v = 0; v < 3; v++) {
             uint8_t vbit = (uint8_t)(1u << v);
             for (int si2 = 0; si2 < subtunes; si2++) {
@@ -1747,31 +1837,282 @@ void Convert(const SWMFile& swm, GT2File& gt) {
             }
         }
         for (int i = 0; i < swm.header.instrument_count; i++) {
-            const SW_Instrument& si2 = swm.instruments[i];
-            uint8_t foff = (si2.params.filtertb_index >= SW1_INSTRUMENT_PARAMSIZE)
-                           ? si2.params.filtertb_index - SW1_INSTRUMENT_PARAMSIZE
-                           : (uint8_t)si2.tables.size();
-            bool has_filter2 = foff < (uint8_t)(si2.tables.size() - 1);
-            if (has_filter2) {
+            if (instHasFilter(i)) {
                 uint8_t vm = ivm.count(i+1) ? ivm[i+1] : 0x07;
                 if (!vm) vm = 0x07;
                 filter_voice_mask[i] = vm;
-                printf("    Inst %d '%.8s': filter mask=0x%02X\n",
+                printf("    Inst %d '%.8s': filter mask=0x%02X (simple)\n",
                        i+1, swm.instruments[i].name, vm);
+            }
+        }
+
+    } else {
+        /* ---- Clone mode: row-level simulation ---- */
+
+        /* Per-pattern row cache: each row stores the note-trigger info */
+        struct RowInfo { uint8_t instr; bool has_note; };
+        std::map<int, std::vector<RowInfo>> ptn_row_cache; /* sw_ptn_1based -> rows */
+
+        auto getRows = [&](int sw_ptn) -> const std::vector<RowInfo>& {
+            auto it = ptn_row_cache.find(sw_ptn);
+            if (it != ptn_row_cache.end()) return it->second;
+            std::vector<RowInfo>& rv = ptn_row_cache[sw_ptn];
+            if (sw_ptn < 1 || sw_ptn > swm.header.pattern_count) return rv;
+            int target_rows = swm.patterns[sw_ptn].length;
+            rv.resize(target_rows, {0, false});
+            const auto& up = UnpackPattern(swm.patterns[sw_ptn].packed);
+            int row = 0;
+            for (size_t ui = 0; ui < up.size() && row < target_rows; ) {
+                uint8_t nb = up[ui++];
+                if (nb >= 0x70 && nb <= 0x77) {
+                    row += (nb - 0x70) + 2;
+                } else if (nb == 0x7E || nb == 0x00) {
+                    row++;
+                } else if (nb & 0x80) {
+                    if (row < target_rows) {
+                        rv[row].has_note = true;
+                        if (ui < up.size()) {
+                            uint8_t ib = up[ui++];
+                            uint8_t iv2 = ib & 0x7F;
+                            if (iv2 >= SW1_INSTRUMENT_MIN && iv2 <= SW1_INSTRUMENT_MAX)
+                                rv[row].instr = iv2;
+                            if (ib & 0x80 && ui < up.size()) {
+                                uint8_t fx = up[ui++];
+                                if (fx > 0 && fx < SW1_SMALLFX_MIN && ui < up.size()) ui++;
+                            }
+                        }
+                    }
+                    row++;
+                } else {
+                    row++;
+                }
+            }
+            return rv;
+        };
+
+        /* Pre-cache all referenced patterns */
+        for (int si2 = 0; si2 < subtunes; si2++)
+            for (int v = 0; v < 3; v++) {
+                const sng_orderlist& ol = gt.orderlists[si2].voice[v];
+                for (int e = 0; e < ol.length; e++) {
+                    uint8_t entry = ol.data[e];
+                    if (entry == SW1_SEQUENCE_LOOPSONG) break;
+                    if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
+                    getRows((int)entry + 1);
+                }
+            }
+
+        /* Row-level filter context:
+         * For each (gt_ptn_0based, row), record which (priority_iv_1based, mask)
+         * is active.  Only recorded when priority_iv has a filter. */
+
+        for (int si2 = 0; si2 < subtunes; si2++) {
+            int n_pos = 0;
+            for (int v = 0; v < 3; v++)
+                n_pos = std::max(n_pos, (int)gt.orderlists[si2].voice[v].length);
+
+            uint8_t cur_instr[3]  = {0, 0, 0}; /* 1-based, per voice */
+            uint8_t priority_iv   = 0;           /* 1-based filter priority */
+
+            for (int pos = 0; pos < n_pos; pos++) {
+                int sw_ptns[3] = {0, 0, 0};
+                int n_rows = 0;
+                for (int v = 0; v < 3; v++) {
+                    const sng_orderlist& ol = gt.orderlists[si2].voice[v];
+                    if (pos >= ol.length) continue;
+                    uint8_t entry = ol.data[pos];
+                    if (entry == SW1_SEQUENCE_LOOPSONG) break;
+                    if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
+                    sw_ptns[v] = (int)entry + 1;
+                    if (sw_ptns[v] >= 1 && sw_ptns[v] <= swm.header.pattern_count)
+                        n_rows = std::max(n_rows, (int)swm.patterns[sw_ptns[v]].length);
+                }
+                if (!n_rows) continue;
+
+                for (int row = 0; row < n_rows; row++) {
+                    /* Collect new triggers this row */
+                    bool triggered[3] = {false, false, false};
+                    for (int v = 0; v < 3; v++) {
+                        if (!sw_ptns[v]) continue;
+                        const auto& rows = getRows(sw_ptns[v]);
+                        if (row >= (int)rows.size()) continue;
+                        if (!rows[row].has_note) continue;
+                        triggered[v] = true;
+                        if (rows[row].instr)
+                            cur_instr[v] = rows[row].instr;
+                    }
+
+                    /* Routing mask: voices whose cur_instr has a filter */
+                    uint8_t mask = 0;
+                    for (int v = 0; v < 3; v++)
+                        if (cur_instr[v] && instHasFilter(cur_instr[v] - 1))
+                            mask |= (uint8_t)(1u << v);
+                    if (!mask) continue;
+
+                    /* Priority: leftmost new trigger with a filter instrument */
+                    for (int v = 0; v < 3; v++) {
+                        if (triggered[v] && cur_instr[v] &&
+                                instHasFilter(cur_instr[v] - 1)) {
+                            priority_iv = cur_instr[v];
+                            break;
+                        }
+                    }
+                    if (!priority_iv) continue;
+
+                    /* Record for each voice whose pattern row is driven by priority_iv */
+                    for (int v = 0; v < 3; v++) {
+                        if (!sw_ptns[v] || cur_instr[v] != priority_iv) continue;
+                        auto key = std::make_pair(sw_ptns[v] - 1, row);
+                        /* Only update if this row has a new priority trigger,
+                         * or if not yet recorded */
+                        if (triggered[v] || row_ctx.find(key) == row_ctx.end())
+                            row_ctx[key] = {priority_iv, mask};
+                    }
+                }
+            }
+        }
+
+        /* Build (iv, mask) -> GT2 instrument index.
+         * Most-common mask per iv becomes the base; others become clones. */
+        std::map<uint8_t, std::map<uint8_t,int>> iv_mask_freq;
+        for (auto& [key, ctx] : row_ctx)
+            iv_mask_freq[ctx.priority_iv][ctx.mask]++;
+
+        for (auto& [iv, mfreq] : iv_mask_freq) {
+            uint8_t base_mask = mfreq.begin()->first;
+            int     best      = 0;
+            for (auto& [m, f] : mfreq)
+                if (f > best) { best = f; base_mask = m; }
+
+            filter_voice_mask[iv - 1]           = base_mask;
+            filter_instr_clone[{iv, base_mask}] = (int)(iv - 1);
+
+            for (auto& [m, f] : mfreq) {
+                if (m == base_mask) continue;
+                int new_idx = (int)gt.instruments.size();
+                gt.instruments.push_back(gt.instruments[iv - 1]);
+                filter_instr_clone[{iv, m}] = new_idx;
+                printf("  Clone inst %d '%.8s' -> GT2 inst %d for filter mask 0x%02X\n",
+                       (int)iv, swm.instruments[iv-1].name, new_idx + 1, m);
+            }
+            printf("    Inst %d '%.8s': base filter mask=0x%02X\n",
+                   (int)iv, swm.instruments[iv-1].name, base_mask);
+        }
+    } /* end clone mode */
+
+    /*---------------------------------------------------------
+     * Post-processing: remap pattern instrument refs to filter clones.
+     * Only runs in clone mode when clones were actually created.
+     *---------------------------------------------------------*/
+    if (filterClone && !filter_instr_clone.empty()) {
+        /* For each (gt_ptn_0based, row) that needs a non-base clone,
+         * remap the instrument reference.  Clone the GT2 pattern first
+         * if the same pattern is also used with the base instrument. */
+        struct RowRemap { int row; int clone_gt_idx; uint8_t sw_iv; };
+        std::map<int, std::vector<RowRemap>> ptn_remaps;
+
+        for (auto& [key, ctx] : row_ctx) {
+            int gt_ptn  = key.first;
+            int row     = key.second;
+            uint8_t iv  = ctx.priority_iv;
+            uint8_t mask = ctx.mask;
+            auto it = filter_instr_clone.find({iv, mask});
+            if (it == filter_instr_clone.end()) continue;
+            int clone_idx = it->second;
+            if (clone_idx == (int)(iv - 1)) continue; /* base — nothing to do */
+            if (gt_ptn < 0 || gt_ptn >= (int)gt.patterns.size()) continue;
+            ptn_remaps[gt_ptn].push_back({row, clone_idx, iv});
+        }
+
+        std::map<std::pair<int,int>, int> ptn_clone_cache;
+
+        for (auto& [gt_ptn, remaps] : ptn_remaps) {
+            if (gt_ptn < 0 || gt_ptn >= (int)gt.patterns.size()) continue;
+
+            /* Group remaps by clone index */
+            std::map<int, std::vector<int>> clone_to_rows;
+            for (auto& rr : remaps)
+                clone_to_rows[rr.clone_gt_idx].push_back(rr.row);
+
+            for (auto& [clone_idx, rows_need] : clone_to_rows) {
+                uint8_t sw_iv = 0;
+                for (auto& rr : remaps)
+                    if (rr.clone_gt_idx == clone_idx) { sw_iv = rr.sw_iv; break; }
+                uint8_t base_gt1 = (uint8_t)sw_iv; /* 1-based GT2 instrument */
+                uint8_t clone_gt1 = (uint8_t)(clone_idx + 1);
+
+                /* Does the pattern have rows using base instrument NOT in rows_need? */
+                bool needs_clone_ptn = false;
+                {
+                    sng_pattern& ptn = gt.patterns[gt_ptn];
+                    if (ptn.data) {
+                        for (int r = 0; r < ptn.rows && !needs_clone_ptn; r++) {
+                            if (ptn.data[r].instrument != base_gt1) continue;
+                            bool in_remap = false;
+                            for (int rn : rows_need) if (rn == r) { in_remap = true; break; }
+                            if (!in_remap) needs_clone_ptn = true;
+                        }
+                    }
+                }
+
+                int target_ptn = gt_ptn;
+                if (needs_clone_ptn) {
+                    auto pc_key = std::make_pair(gt_ptn, clone_idx);
+                    auto pc_it  = ptn_clone_cache.find(pc_key);
+                    if (pc_it != ptn_clone_cache.end()) {
+                        target_ptn = pc_it->second;
+                    } else {
+                        sng_pattern ptn_copy = gt.patterns[gt_ptn];
+                        target_ptn = (int)gt.patterns.size();
+                        gt.patterns.push_back(ptn_copy);
+                        ptn_clone_cache[pc_key] = target_ptn;
+                        printf("  Cloned GT2 pattern %d -> %d (filter clone inst %d)\n",
+                               gt_ptn + 1, target_ptn + 1, clone_idx + 1);
+                    }
+                }
+
+                if (target_ptn < 0 || target_ptn >= (int)gt.patterns.size()) continue;
+                sng_pattern& ptn = gt.patterns[target_ptn];
+                if (!ptn.data || !ptn.rows) continue;
+
+                /* Remap the specific rows */
+                for (int rn : rows_need) {
+                    if (rn < ptn.rows && ptn.data[rn].instrument == base_gt1)
+                        ptn.data[rn].instrument = clone_gt1;
+                }
+
+                /* Point relevant orderlist entries to the cloned pattern */
+                if (needs_clone_ptn && target_ptn != gt_ptn && target_ptn <= 0xFF) {
+                    for (int si2 = 0; si2 < subtunes; si2++)
+                        for (int v = 0; v < 3; v++) {
+                            sng_orderlist& ol = gt.orderlists[si2].voice[v];
+                            for (int e = 0; e < ol.length; e++)
+                                if (ol.data[e] == (uint8_t)gt_ptn)
+                                    ol.data[e] = (uint8_t)target_ptn;
+                        }
+                }
             }
         }
     }
 
-    /* No instrument cloning for filter */
-    struct PosFilterInfo { uint8_t designated_iv; uint8_t sim_mask; };
-    std::vector<PosFilterInfo> pos_filter_info;
-    std::map<std::pair<uint8_t,uint8_t>, int> filter_instr_clone;
 
-        /* Tables (wave, pulse, filter rebuilt from instruments, now with voice assignments) */
-    /* Extend sw_instr to cover any duplicated entries (they share the same SW source) */
+
+    /* Build sw_instr_ext: one SW_Instrument entry per GT2 instrument slot.
+     * Original slots (0..N-1) map directly to swm.instruments[i].
+     * Clone slots (N..) map back to their source SW instrument using
+     * filter_instr_clone, so ReconstructTables uses the correct tables. */
     std::vector<SW_Instrument> sw_instr_ext = swm.instruments;
-    while ((int)sw_instr_ext.size() < (int)gt.instruments.size())
-        sw_instr_ext.push_back(sw_instr_ext.back());
+    {
+        std::map<int,int> clone_to_sw; /* gt_idx(0-based) -> sw_idx(0-based) */
+        for (auto& [key, gt_idx] : filter_instr_clone)
+            clone_to_sw[gt_idx] = (int)(key.first) - 1;
+        for (int gi = (int)swm.instruments.size(); gi < (int)gt.instruments.size(); gi++) {
+            auto it = clone_to_sw.find(gi);
+            sw_instr_ext.push_back(it != clone_to_sw.end()
+                ? swm.instruments[it->second]
+                : swm.instruments.back());
+        }
+    }
 
     /* Pre-allocate wave table with maximum capacity (255 entries) so that
      * GetOrCreateArpWtPos can safely append chord-arp entries to it after
@@ -1780,113 +2121,22 @@ void Convert(const SWMFile& swm, GT2File& gt) {
     gt.wavetable.right = new uint8_t[255]();
     gt.wavetable.length = 0;
 
-    /* Extend filter_voice_mask to cover cloned instrument entries.
-     * For clones created for distinct masks, look up their mask from filter_instr_clone. */
+    /* Extend filter_voice_mask and voice_assignments to cover cloned GT2 instruments.
+     * filter_instr_clone maps (sw_iv, mask) -> gt_idx; use it to assign each clone's mask. */
     std::vector<uint8_t> filter_voice_mask_ext = filter_voice_mask;
-    /* Clones were appended after the base instruments; find their masks */
-    for (auto& [key, gt_idx] : filter_instr_clone) {
-        uint8_t sw_num = key.first;
-        uint8_t mask   = key.second;
-        if (gt_idx >= (int)filter_voice_mask_ext.size())
-            filter_voice_mask_ext.resize(gt_idx + 1, 0);
-        filter_voice_mask_ext[gt_idx] = mask;
-        (void)sw_num;
-    }
-    while ((int)filter_voice_mask_ext.size() < (int)gt.instruments.size())
-        filter_voice_mask_ext.push_back(0);
+    filter_voice_mask_ext.resize(gt.instruments.size(), 0);
+    for (auto& [key, gt_idx] : filter_instr_clone)
+        if (gt_idx < (int)filter_voice_mask_ext.size())
+            filter_voice_mask_ext[gt_idx] = key.second;
 
-    /* Extend voice_assignments to cover any cloned instrument entries.
-     * Clones share the same voice routing as their source instrument. */
-    while ((int)voice_assignments.size() < (int)gt.instruments.size())
-        voice_assignments.push_back(0);
+    /* Clones share voice routing with their source; pad with 0 for safety. */
+    voice_assignments.resize(gt.instruments.size(), 0);
 
-    printf("  Calling ReconstructTables: %d instruments, voice_assignments.size()=%d, filter_ext.size()=%d\n",
-           (int)gt.instruments.size(), (int)voice_assignments.size(),
-           (int)filter_voice_mask_ext.size());
     ReconstructTables(sw_instr_ext, gt.instruments, voice_assignments,
                       filter_voice_mask_ext,
                       swm.chords.empty() ? nullptr : &swm.chords,
                       gt.wavetable, gt.pulsetable, gt.filtertable);
 
-    /*---------------------------------------------------------
-     * Post-processing: remap filter instrument clones in patterns.
-     *---------------------------------------------------------*/
-    printf("  Post-processing: gt.patterns.size()=%d gt.instruments.size()=%d\n",
-           (int)gt.patterns.size(), (int)gt.instruments.size());
-    if (!filter_instr_clone.empty() && !pos_filter_info.empty()) {
-        auto base_gt_idx = [&](uint8_t sw_iv) -> int { return (int)(sw_iv - 1); };
-        std::map<std::pair<int,uint8_t>, int> ptn_clone_cache;
-
-        for (int si2 = 0; si2 < subtunes; si2++) {
-            sng_orderlist& ol = gt.orderlists[si2].voice[0];
-            for (int e = 0; e < ol.length; e++) {
-                uint8_t entry = ol.data[e];
-                if (entry == SW1_SEQUENCE_LOOPSONG) break;
-                if (entry >= GT2_ORDERLIST_TRANS_MIN) continue;
-
-                int pos_idx = e;
-                if (pos_idx >= (int)pos_filter_info.size()) continue;
-
-                uint8_t desig_iv  = pos_filter_info[pos_idx].designated_iv;
-                uint8_t need_mask = pos_filter_info[pos_idx].sim_mask;
-                if (!desig_iv || !need_mask) continue;
-
-                auto clone_it = filter_instr_clone.find(std::make_pair(desig_iv, need_mask));
-                if (clone_it == filter_instr_clone.end()) continue;
-
-                int clone_gt_idx = clone_it->second;
-                int base_idx     = base_gt_idx(desig_iv);
-                if (clone_gt_idx == base_idx) continue;
-
-                int orig_ptn_idx = (int)entry;
-                /* Bounds check: orig_ptn_idx must be a valid pattern */
-                if (orig_ptn_idx < 0 || orig_ptn_idx >= (int)gt.patterns.size()) continue;
-
-                /* Check if this pattern is also used at positions needing a different mask */
-                bool need_clone = false;
-                for (int e2 = 0; e2 < ol.length && !need_clone; e2++) {
-                    if (e2 == e) continue;
-                    if (ol.data[e2] != entry) continue;
-                    if (e2 >= (int)pos_filter_info.size()) continue;
-                    if (pos_filter_info[e2].sim_mask != need_mask) need_clone = true;
-                }
-
-                int target_ptn_idx = orig_ptn_idx;
-                if (need_clone) {
-                    auto pc_key = std::make_pair(orig_ptn_idx, need_mask);
-                    auto pc_it  = ptn_clone_cache.find(pc_key);
-                    if (pc_it != ptn_clone_cache.end()) {
-                        target_ptn_idx = pc_it->second;
-                    } else {
-                        /* Copy-then-push to avoid self-reference invalidation */
-                        sng_pattern ptn_copy = gt.patterns[orig_ptn_idx];
-                        target_ptn_idx = (int)gt.patterns.size();
-                        gt.patterns.push_back(ptn_copy);
-                        ptn_clone_cache[pc_key] = target_ptn_idx;
-                        printf("  Cloned GT2 pattern %d -> %d for filter mask 0x%02X\n",
-                               orig_ptn_idx + 1, target_ptn_idx + 1, need_mask);
-                    }
-                }
-
-                /* Bounds check on target pattern */
-                if (target_ptn_idx < 0 || target_ptn_idx >= (int)gt.patterns.size()) continue;
-
-                /* Remap instrument rows */
-                sng_pattern& ptn = gt.patterns[target_ptn_idx];
-                if (!ptn.data || ptn.rows == 0) continue;
-                uint8_t old_gt_instr = (uint8_t)(base_idx + 1);
-                uint8_t new_gt_instr = (uint8_t)(clone_gt_idx + 1);
-                for (int r = 0; r < ptn.rows; r++) {
-                    if (ptn.data[r].instrument == old_gt_instr)
-                        ptn.data[r].instrument = new_gt_instr;
-                }
-
-                /* Update orderlist — only if within uint8_t range */
-                if (target_ptn_idx <= 0xFF)
-                    ol.data[e] = (uint8_t)target_ptn_idx;
-            }
-        }
-    }
 
     /*---------------------------------------------------------
      * Speedtable + Tempo
@@ -1968,7 +2218,7 @@ void Convert(const SWMFile& swm, GT2File& gt) {
 
     /* Patterns (SWM numbering starts at 1, GT2 from 0) */
     gt.patterns.resize(swm.header.pattern_count);
-    std::map<int,uint8_t> arp_cache;
+    std::map<std::pair<int,int>,uint8_t> arp_cache;
 
     /* Per-voice active instrument state, carried across pattern boundaries.
      * Indexed [subtune * 3 + voice].  Each entry is the SW instrument number
@@ -2002,7 +2252,8 @@ void Convert(const SWMFile& swm, GT2File& gt) {
                     ConvertPattern(swm.patterns[ptn_idx + 1], gt.patterns[ptn_idx],
                                    spdBuilder, tcmd, tparam,
                                    swm.chords.empty() ? nullptr : &swm.chords,
-                                   &arp_cache, &gt, &oct_shifts, vinstr);
+                                   &arp_cache, &gt, &oct_shifts, vinstr,
+                                   &swm.instruments);
                     ptn_converted[ptn_idx] = true;
                 } else {
                     /* Pattern already converted; still thread the instrument state
