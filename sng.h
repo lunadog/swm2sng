@@ -1,4 +1,4 @@
-// $Id: sng.h 360 2014-02-15 14:50:28Z soci $
+
 #define CASTINT static_cast<int>
 #define GT2_TAG_SIZE 4
 #define GT2_NAME_SIZE 32

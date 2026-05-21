@@ -1,6 +1,5 @@
 //================SID-Wizard SWM1 workfile format description===================
 //(unfortunately this format cannot be used by 64tass at the same time...that's why SWM-spec.src is still used in SID-Wizard)
-// $Id: swm.h 360 2014-02-15 14:50:28Z soci $
 
 #include <map>
 #include <vector>
@@ -135,7 +134,8 @@ struct swm_header
     unsigned char colour_theme; //$11 - editor-setting, default is 0
     unsigned char keyboard_type; //$12 - editor-setting (GT or DMC note/jamming-keyboard), default is 0 (GT 2-row)
     unsigned char driver_type; //$13 - just an information, which driver/player (normal/light/etc.), default is 0
-    unsigned char not_defined[(SW1_HEADER_SIZE-SW1_AUTHORINFO_SIZE)-0x14]; //.....for later expansions
+    unsigned char tuning_type; //$14 - default is 0
+    unsigned char not_defined[(SW1_HEADER_SIZE-SW1_AUTHORINFO_SIZE)-0x15]; //.....for later expansions
     char authorinfo[SW1_AUTHORINFO_SIZE]; //$18th position
 };
 
