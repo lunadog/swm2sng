@@ -8,11 +8,13 @@
  * SWM pattern block format
  * ------------------------
  * Each pattern block: [packed row data ...][SIZE byte][LENGTH byte]
- *   LENGTH = row count.  SID-Wizard detects it by reading the file
- *   backwards (LENGTH and SIZE are at the end of each block); we detect
- *   it by parsing forward and peeking ahead: when the byte two positions
- *   ahead equals rows parsed so far, the current byte is SIZE and the
- *   next is LENGTH.
+ *   LENGTH = row count.  We detect the terminator by reading the whole
+ *   pattern block into memory and using a backtracking parser: at each
+ *   position we check if [SIZE][LENGTH] is a plausible terminator
+ *   (LENGTH==rows_parsed, delta=SIZE-consumed in [0..64]), and if so
+ *   recurse to verify the remaining patterns also parse cleanly.
+ *   This handles files where the first valid terminator candidate is a
+ *   false positive — the backtracker tries the next candidate instead.
  *
  * Row encoding in the packed stream:
  *   Terminology (per SID-Wizard author):
@@ -68,6 +70,7 @@
 #include "swm.h"
 #include <set>
 #include "sng.h"
+#include <functional>
 
 /*************************************************************
  * File utilities
@@ -366,92 +369,88 @@ void LoadSWM(const char* path, SWMFile& swm) {
      * walk used fseek internally, leaving the file pointer in the wrong place). */
     fseek(f, pattern_block_start, SEEK_SET);
 
-    for (int pi = 1; pi <= swm.header.pattern_count; pi++) {
-        SW_Pattern& ptn = swm.patterns[pi];
+    /* Read the whole pattern block into memory for backtracking parse.
+     * Backtracking is needed because some patterns have multiple plausible
+     * [SIZE][ROWS] terminators within delta<=64, and the first one is not
+     * always correct.  Working in memory avoids repeated fseek overhead. */
+    size_t ptn_block_len = (size_t)(instr_block_start - pattern_block_start);
+    std::vector<uint8_t> pblk(ptn_block_len);
+    if (fread(pblk.data(), 1, ptn_block_len, f) != ptn_block_len)
+        die("Unexpected EOF reading pattern block");
 
-        /* We buffer data from the file until the block ends. */
-        std::vector<uint8_t> buf;
+    /* Returns the packed bytes consumed (excluding the trailing SIZE+ROWS bytes)
+     * and the row count if a valid terminator was found at pblk[pos], else -1. */
+    auto tryTerminator = [&](size_t pos, size_t start, int rows) -> int {
+        if (pos + 1 >= ptn_block_len) return -1;
+        uint8_t peek_size = pblk[pos];
+        uint8_t peek_len  = pblk[pos + 1];
+        if (rows <= 0 || peek_len != (uint8_t)rows) return -1;
+        long consumed = (long)(pos - start);
+        long delta    = (long)peek_size - consumed;
+        if (delta < 0 || delta > 64) return -1;
+        return (int)rows;
+    };
+
+    /* Recursive backtracking parser.
+     * Returns true and fills offsets[] with end-of-pattern positions (0-based
+     * index into pblk, pointing just past the SIZE+ROWS bytes) if all
+     * pattern_count patterns fit exactly in [pos .. ptn_block_len). */
+    int n_ptns = swm.header.pattern_count;
+    std::vector<size_t> ptn_ends(n_ptns, 0);
+
+    std::function<bool(int, size_t)> backtrack = [&](int pi, size_t pos) -> bool {
+        if (pi == n_ptns) return pos == ptn_block_len;
+        size_t start = pos;
         int rows = 0;
-        bool found = false;
-
-        /* Safety: each pattern can't be larger than some sane bound. */
-        const int MAX_BLOCK = 4096;
-        long ptn_start = ftell(f); /* used for SIZE plausibility check */
-
-        for (int guard = 0; guard < MAX_BLOCK && !found; guard++) {
-            /* Before reading the next row, peek ahead.
-             * The next byte in the file is the start of the next row
-             * (or the SIZE byte if we're at the end of the block).
-             * We detect end-of-block by checking if the byte TWO
-             * positions ahead equals rows: that would be the LENGTH byte
-             * and the current position would be the SIZE byte.
-             *
-             * In practice we just try: peek at file[pos+1] (one beyond
-             * the byte we're about to read) to see if it matches rows.
-             * We do this by peeking at the file without consuming. */
-
-            /* Peek two bytes ahead using fseek/ftell (portable).
-             * Byte at current pos may be SIZE; byte after may be LENGTH. */
-            long pos = ftell(f);
-            int peek_size = fgetc(f);
-            if (peek_size == EOF) die("Unexpected EOF seeking pattern size");
-            int peek_len  = fgetc(f);
-            if (peek_len  == EOF) die("Unexpected EOF seeking pattern length");
-            fseek(f, pos, SEEK_SET);  /* rewind both bytes */
-
-            /* If peek_len == rows && rows > 0: end of block found.
-             * Guard 1: SIZE plausibility — delta in [0..32] rejects false
-             *          positives where an instrument byte equals rows_parsed.
-             * Guard 2: pos+2 must not exceed instr_block_start (hard stop). */
-            long bytes_consumed = ftell(f) - ptn_start;
-            if (rows > 0 && (uint8_t)peek_len == (uint8_t)rows
-                && (long)(uint8_t)peek_size - bytes_consumed >= 0
-                && (long)(uint8_t)peek_size - bytes_consumed <= 32
-                && ftell(f) + 2 <= instr_block_start) {
-                /* Consume SIZE and LENGTH bytes */
-                ptn.size_byte = (uint8_t)fgetc(f);
-                ptn.length    = (uint8_t)fgetc(f);
-                found = true;
-                break;
+        const size_t MAX_SCAN = 65536;
+        for (size_t guard = 0; guard < MAX_SCAN && pos < ptn_block_len; guard++) {
+            /* Try terminator at current position */
+            if (tryTerminator(pos, start, rows) >= 0) {
+                size_t end = pos + 2;
+                ptn_ends[pi] = end;
+                if (backtrack(pi + 1, end)) return true;
+                /* That candidate didn't lead to a complete parse; continue */
             }
-
-            /* Read and process one row */
-            uint8_t note = read8(f);
-            buf.push_back(note);
-
-            if (note >= 0x70 && note <= 0x77) {
-                /* Run of rest rows, no extra bytes */
-                rows += (note - 0x70) + 2;
-            } else if (note == 0x7E) {
-                /* Single rest row, no extra bytes */
+            /* Consume one row byte */
+            uint8_t b = pblk[pos++];
+            if (b >= 0x70 && b <= 0x77) {
+                rows += (b - 0x70) + 2;
+            } else if (b == 0x7E || b == 0x00) {
                 rows += 1;
-            } else if (note & 0x80) {
-                /* Note with instrument byte */
+            } else if (b & 0x80) {
                 rows += 1;
-                uint8_t instr = read8(f);
-                buf.push_back(instr);
+                if (pos >= ptn_block_len) break;
+                uint8_t instr = pblk[pos++];
                 if (instr & 0x80) {
-                    /* FX byte present */
-                    uint8_t fx = read8(f);
-                    buf.push_back(fx);
+                    if (pos >= ptn_block_len) break;
+                    uint8_t fx = pblk[pos++];
                     if (fx > 0 && fx < SW1_SMALLFX_MIN) {
-                        /* Big FX: parameter byte present */
-                        uint8_t param = read8(f);
-                        buf.push_back(param);
+                        if (pos >= ptn_block_len) break;
+                        pos++; /* skip fxval */
                     }
                 }
             } else {
-                /* Other note-only row (including 0x00 rest) */
-                rows += 1;
+                rows += 1; /* 0x01..0x6F: note without instrument */
             }
         }
+        return false;
+    };
 
-        if (!found)
-            die("Pattern block parse failed: could not locate SIZE/LENGTH bytes");
+    if (!backtrack(0, 0))
+        die("Pattern block parse failed: could not locate SIZE/LENGTH bytes");
 
-        ptn.packed = buf;
+    /* Re-parse each pattern from pblk using the confirmed end positions */
+    size_t blk_pos = 0;
+    for (int pi = 1; pi <= n_ptns; pi++) {
+        SW_Pattern& ptn = swm.patterns[pi];
+        size_t end = ptn_ends[pi - 1];
+        /* end-2 = SIZE byte, end-1 = ROWS byte */
+        ptn.size_byte = pblk[end - 2];
+        ptn.length    = pblk[end - 1];
+        ptn.packed.assign(pblk.begin() + blk_pos, pblk.begin() + end - 2);
         printf("  Pattern %2d: %d rows, %zu packed bytes, size_byte=0x%02X\n",
                pi, ptn.length, ptn.packed.size(), ptn.size_byte);
+        blk_pos = end;
     }
 
     /*---------------------------------------------------------
@@ -1270,10 +1269,11 @@ static void SWFilterToGT2Filter(
 
     /* If the loop exited because the data ran out (no SW1_TABLE_END or
      * SW1_TABLE_JUMP was encountered), the last GT2 entry written will
-     * not be a terminator.  Always ensure the filter definition ends with
-     * FF 00 (stop) so GoatTracker knows where the table ends. */
-    if (fl_left.empty() ||
-        !(fl_left.back() == 0xFF)) {
+     * not be a terminator.  Only add FF 00 if we actually emitted something
+     * useful; an all-skip filter section (e.g. [0x00 0x00 0x00] with R=0)
+     * should leave fl_left unchanged so the caller sets gi.fl = 0. */
+    bool emitted_something = (fl_left.size() >= gt2_table_start);
+    if (emitted_something && fl_left.back() != 0xFF) {
         fl_left .push_back(0xFF);
         fl_right.push_back(0x00);
     }
@@ -1782,13 +1782,52 @@ void Convert(const SWMFile& swm, GT2File& gt, bool filterClone) {
      *---------------------------------------------------------*/
 
     /* Helper: does instrument i (0-based) have a filter table? */
+    /* Build a set of filter (L,R) parameter pairs that are UNIQUE across all
+     * instruments.  If multiple instruments share the same filter params, they
+     * were likely tagged as "filtered channel" by sng2swm but don't actually
+     * control the filter independently — only uniquely-parameterised instruments
+     * are real filter setters.  All-zero params (0x00,0x00) are always excluded. */
+    std::map<std::pair<uint8_t,uint8_t>, int> filter_param_count;
+    for (int i = 0; i < swm.header.instrument_count; i++) {
+        const SW_Instrument& si2 = swm.instruments[i];
+        uint8_t foff = (si2.params.filtertb_index >= SW1_INSTRUMENT_PARAMSIZE)
+                       ? si2.params.filtertb_index - SW1_INSTRUMENT_PARAMSIZE
+                       : (uint8_t)si2.tables.size();
+        if (foff >= (uint8_t)(si2.tables.size() - 1)) continue; /* no filter */
+        uint8_t L = si2.tables[foff];
+        uint8_t R = (foff + 1 < (uint8_t)si2.tables.size()) ? si2.tables[foff + 1] : 0;
+        if (L == 0 && R == 0) continue; /* all-zero: skip */
+        filter_param_count[{L, R}]++;
+    }
+
     auto instHasFilter = [&](int i) -> bool {
         if (i < 0 || i >= swm.header.instrument_count) return false;
         const SW_Instrument& si2 = swm.instruments[i];
         uint8_t foff = (si2.params.filtertb_index >= SW1_INSTRUMENT_PARAMSIZE)
                        ? si2.params.filtertb_index - SW1_INSTRUMENT_PARAMSIZE
                        : (uint8_t)si2.tables.size();
-        return foff < (uint8_t)(si2.tables.size() - 1);
+        if (foff >= (uint8_t)(si2.tables.size() - 1)) return false;
+        uint8_t L = si2.tables[foff];
+        uint8_t R = (foff + 1 < (uint8_t)si2.tables.size()) ? si2.tables[foff + 1] : 0;
+        if (L == 0 && R == 0) return false; /* all-zero = pass-through */
+        /* Shared filter params = sng2swm channel-routing artifact, not a real setter */
+        return filter_param_count.count({L, R}) && filter_param_count.at({L, R}) == 1;
+    };
+
+    /* instHasFilterRaw: true if the instrument has ANY non-empty filter section,
+     * regardless of uniqueness.  Used for computing the routing mask — voices
+     * whose instruments have a filter section (even pass-through ones) should
+     * be routed through the filter set by the priority instrument. */
+    auto instHasFilterRaw = [&](int i) -> bool {
+        if (i < 0 || i >= swm.header.instrument_count) return false;
+        const SW_Instrument& si2 = swm.instruments[i];
+        uint8_t foff = (si2.params.filtertb_index >= SW1_INSTRUMENT_PARAMSIZE)
+                       ? si2.params.filtertb_index - SW1_INSTRUMENT_PARAMSIZE
+                       : (uint8_t)si2.tables.size();
+        if (foff >= (uint8_t)(si2.tables.size() - 1)) return false;
+        uint8_t L = si2.tables[foff];
+        uint8_t R = (foff + 1 < (uint8_t)si2.tables.size()) ? si2.tables[foff + 1] : 0;
+        return !(L == 0 && R == 0);
     };
 
     /* filter_voice_mask[i] = GT2 channel routing byte for instrument i (0-based).
@@ -1838,7 +1877,13 @@ void Convert(const SWMFile& swm, GT2File& gt, bool filterClone) {
         }
         for (int i = 0; i < swm.header.instrument_count; i++) {
             if (instHasFilter(i)) {
-                uint8_t vm = ivm.count(i+1) ? ivm[i+1] : 0x07;
+                /* Voice mask: include voices from ALL raw-filter instruments,
+                 * not just unique setters, so the routing covers pass-throughs too. */
+                uint8_t vm = 0;
+                for (int j = 0; j < swm.header.instrument_count; j++) {
+                    if (instHasFilterRaw(j) && ivm.count(j+1))
+                        vm |= ivm[j+1];
+                }
                 if (!vm) vm = 0x07;
                 filter_voice_mask[i] = vm;
                 printf("    Inst %d '%.8s': filter mask=0x%02X (simple)\n",
@@ -1942,14 +1987,18 @@ void Convert(const SWMFile& swm, GT2File& gt, bool filterClone) {
                             cur_instr[v] = rows[row].instr;
                     }
 
-                    /* Routing mask: voices whose cur_instr has a filter */
+                    /* Routing mask: voices whose cur_instr has ANY filter section
+                     * (including pass-through instruments).  This ensures voices
+                     * routed through the filter in SID-Wizard are also routed in GT2,
+                     * even if those instruments are not themselves priority setters. */
                     uint8_t mask = 0;
                     for (int v = 0; v < 3; v++)
-                        if (cur_instr[v] && instHasFilter(cur_instr[v] - 1))
+                        if (cur_instr[v] && instHasFilterRaw(cur_instr[v] - 1))
                             mask |= (uint8_t)(1u << v);
                     if (!mask) continue;
 
-                    /* Priority: leftmost new trigger with a filter instrument */
+                    /* Priority: leftmost new trigger with a UNIQUE filter instrument
+                     * (instHasFilter, not raw — only real setters change priority). */
                     for (int v = 0; v < 3; v++) {
                         if (triggered[v] && cur_instr[v] &&
                                 instHasFilter(cur_instr[v] - 1)) {
@@ -1979,10 +2028,18 @@ void Convert(const SWMFile& swm, GT2File& gt, bool filterClone) {
             iv_mask_freq[ctx.priority_iv][ctx.mask]++;
 
         for (auto& [iv, mfreq] : iv_mask_freq) {
+            /* Base mask: use the mask routing the MOST voices (highest popcount).
+             * This ensures the base instrument covers the widest filter context;
+             * clones handle reduced-voice cases.  Ties broken by highest value. */
             uint8_t base_mask = mfreq.begin()->first;
-            int     best      = 0;
-            for (auto& [m, f] : mfreq)
-                if (f > best) { best = f; base_mask = m; }
+            int     best_pop  = -1;
+            for (auto& [m, f] : mfreq) {
+                int pop = __builtin_popcount(m);
+                if (pop > best_pop || (pop == best_pop && m > base_mask)) {
+                    best_pop  = pop;
+                    base_mask = m;
+                }
+            }
 
             filter_voice_mask[iv - 1]           = base_mask;
             filter_instr_clone[{iv, base_mask}] = (int)(iv - 1);
@@ -2004,96 +2061,6 @@ void Convert(const SWMFile& swm, GT2File& gt, bool filterClone) {
      * Post-processing: remap pattern instrument refs to filter clones.
      * Only runs in clone mode when clones were actually created.
      *---------------------------------------------------------*/
-    if (filterClone && !filter_instr_clone.empty()) {
-        /* For each (gt_ptn_0based, row) that needs a non-base clone,
-         * remap the instrument reference.  Clone the GT2 pattern first
-         * if the same pattern is also used with the base instrument. */
-        struct RowRemap { int row; int clone_gt_idx; uint8_t sw_iv; };
-        std::map<int, std::vector<RowRemap>> ptn_remaps;
-
-        for (auto& [key, ctx] : row_ctx) {
-            int gt_ptn  = key.first;
-            int row     = key.second;
-            uint8_t iv  = ctx.priority_iv;
-            uint8_t mask = ctx.mask;
-            auto it = filter_instr_clone.find({iv, mask});
-            if (it == filter_instr_clone.end()) continue;
-            int clone_idx = it->second;
-            if (clone_idx == (int)(iv - 1)) continue; /* base — nothing to do */
-            if (gt_ptn < 0 || gt_ptn >= (int)gt.patterns.size()) continue;
-            ptn_remaps[gt_ptn].push_back({row, clone_idx, iv});
-        }
-
-        std::map<std::pair<int,int>, int> ptn_clone_cache;
-
-        for (auto& [gt_ptn, remaps] : ptn_remaps) {
-            if (gt_ptn < 0 || gt_ptn >= (int)gt.patterns.size()) continue;
-
-            /* Group remaps by clone index */
-            std::map<int, std::vector<int>> clone_to_rows;
-            for (auto& rr : remaps)
-                clone_to_rows[rr.clone_gt_idx].push_back(rr.row);
-
-            for (auto& [clone_idx, rows_need] : clone_to_rows) {
-                uint8_t sw_iv = 0;
-                for (auto& rr : remaps)
-                    if (rr.clone_gt_idx == clone_idx) { sw_iv = rr.sw_iv; break; }
-                uint8_t base_gt1 = (uint8_t)sw_iv; /* 1-based GT2 instrument */
-                uint8_t clone_gt1 = (uint8_t)(clone_idx + 1);
-
-                /* Does the pattern have rows using base instrument NOT in rows_need? */
-                bool needs_clone_ptn = false;
-                {
-                    sng_pattern& ptn = gt.patterns[gt_ptn];
-                    if (ptn.data) {
-                        for (int r = 0; r < ptn.rows && !needs_clone_ptn; r++) {
-                            if (ptn.data[r].instrument != base_gt1) continue;
-                            bool in_remap = false;
-                            for (int rn : rows_need) if (rn == r) { in_remap = true; break; }
-                            if (!in_remap) needs_clone_ptn = true;
-                        }
-                    }
-                }
-
-                int target_ptn = gt_ptn;
-                if (needs_clone_ptn) {
-                    auto pc_key = std::make_pair(gt_ptn, clone_idx);
-                    auto pc_it  = ptn_clone_cache.find(pc_key);
-                    if (pc_it != ptn_clone_cache.end()) {
-                        target_ptn = pc_it->second;
-                    } else {
-                        sng_pattern ptn_copy = gt.patterns[gt_ptn];
-                        target_ptn = (int)gt.patterns.size();
-                        gt.patterns.push_back(ptn_copy);
-                        ptn_clone_cache[pc_key] = target_ptn;
-                        printf("  Cloned GT2 pattern %d -> %d (filter clone inst %d)\n",
-                               gt_ptn + 1, target_ptn + 1, clone_idx + 1);
-                    }
-                }
-
-                if (target_ptn < 0 || target_ptn >= (int)gt.patterns.size()) continue;
-                sng_pattern& ptn = gt.patterns[target_ptn];
-                if (!ptn.data || !ptn.rows) continue;
-
-                /* Remap the specific rows */
-                for (int rn : rows_need) {
-                    if (rn < ptn.rows && ptn.data[rn].instrument == base_gt1)
-                        ptn.data[rn].instrument = clone_gt1;
-                }
-
-                /* Point relevant orderlist entries to the cloned pattern */
-                if (needs_clone_ptn && target_ptn != gt_ptn && target_ptn <= 0xFF) {
-                    for (int si2 = 0; si2 < subtunes; si2++)
-                        for (int v = 0; v < 3; v++) {
-                            sng_orderlist& ol = gt.orderlists[si2].voice[v];
-                            for (int e = 0; e < ol.length; e++)
-                                if (ol.data[e] == (uint8_t)gt_ptn)
-                                    ol.data[e] = (uint8_t)target_ptn;
-                        }
-                }
-            }
-        }
-    }
 
 
 
@@ -2181,6 +2148,57 @@ void Convert(const SWMFile& swm, GT2File& gt, bool filterClone) {
 
         printf("  Subtune %d: SWM tempo1=0x%02X -> GT2 TEMPO(%d)\n",
                si+1, swm.tempos[si].tempo1, t1);
+
+        /* Collect the first (orderlist pos 0) SW pattern for each voice.
+         * If ANY of them already carries a tempo FX at row 0 in the SW pattern
+         * data, the song self-establishes its tempo and no injection is needed.
+         * Injecting would re-assert the subtune default every time one of the
+         * other voices' pos-0 patterns loops back, causing incorrect speed. */
+        auto swPtnHasTempoAtRow0 = [&](int sw_ptn_1based) -> bool {
+            if (sw_ptn_1based < 1 ||
+                sw_ptn_1based > swm.header.pattern_count) return false;
+            const auto& raw = swm.patterns[sw_ptn_1based].packed;
+            int row = 0;
+            for (size_t bi = 0; bi < raw.size(); ) {
+                uint8_t b = raw[bi++];
+                if (b >= 0x70 && b <= 0x77) { row += (b-0x70)+2; break; }
+                if (b == 0x7E || b == 0x00) { row++; break; }
+                if (b & 0x80) {
+                    row++;
+                    if (bi >= raw.size()) break;
+                    uint8_t ib = raw[bi++];
+                    if (ib & 0x80) {
+                        if (bi >= raw.size()) break;
+                        uint8_t fx = raw[bi++];
+                        if (fx == SW1_BIGFX_TEMPO || fx == SW1_BIGFX_FUNKTEMPO)
+                            return true;
+                        if (fx > 0 && fx < SW1_SMALLFX_MIN && bi < raw.size())
+                            bi++;  /* skip fxval */
+                    }
+                    break; /* only care about row 0 */
+                }
+                break;
+            }
+            return false;
+        };
+
+        bool any_pos0_has_tempo = false;
+        for (int v = 0; v < 3; v++) {
+            const sng_orderlist& ol = gt.orderlists[si].voice[v];
+            for (int e = 0; e < ol.length; e++) {
+                uint8_t entry = ol.data[e];
+                if (entry < GT2_ORDERLIST_TRANS_MIN) {
+                    int sw_ptn = (int)entry + 1; /* GT2 0-based -> SW 1-based */
+                    if (swPtnHasTempoAtRow0(sw_ptn))
+                        any_pos0_has_tempo = true;
+                    break;
+                }
+            }
+        }
+        if (any_pos0_has_tempo) {
+            printf("    (pos-0 pattern already has tempo FX; skipping injection)\n");
+            continue;
+        }
 
         /* Find first pattern of each voice for this subtune */
         for (int v = 0; v < 3; v++) {
@@ -2296,6 +2314,103 @@ void Convert(const SWMFile& swm, GT2File& gt, bool filterClone) {
 
     /* Commit speedtable (may have entries from tempo and/or slide effects) */
     spdBuilder.fill(gt.speedtable);
+
+    if (filterClone && !filter_instr_clone.empty()) {
+        /* For each (gt_ptn_0based, row) that needs a non-base clone,
+         * remap the instrument reference.  Clone the GT2 pattern first
+         * if the same pattern is also used with the base instrument. */
+        struct RowRemap { int row; int clone_gt_idx; uint8_t sw_iv; };
+        std::map<int, std::vector<RowRemap>> ptn_remaps;
+
+        for (auto& [key, ctx] : row_ctx) {
+            int gt_ptn  = key.first;
+            int row     = key.second;
+            uint8_t iv  = ctx.priority_iv;
+            uint8_t mask = ctx.mask;
+            auto it = filter_instr_clone.find({iv, mask});
+            if (it == filter_instr_clone.end()) continue;
+            int clone_idx = it->second;
+            if (clone_idx == (int)(iv - 1)) continue; /* base — nothing to do */
+            if (gt_ptn < 0 || gt_ptn >= (int)gt.patterns.size()) continue;
+            ptn_remaps[gt_ptn].push_back({row, clone_idx, iv});
+        }
+
+        std::map<std::pair<int,int>, int> ptn_clone_cache;
+
+        for (auto& [gt_ptn, remaps] : ptn_remaps) {
+            if (gt_ptn < 0 || gt_ptn >= (int)gt.patterns.size()) continue;
+
+            /* Group remaps by clone index */
+            std::map<int, std::vector<int>> clone_to_rows;
+            for (auto& rr : remaps)
+                clone_to_rows[rr.clone_gt_idx].push_back(rr.row);
+
+            for (auto& [clone_idx, rows_need] : clone_to_rows) {
+                uint8_t sw_iv = 0;
+                for (auto& rr : remaps)
+                    if (rr.clone_gt_idx == clone_idx) { sw_iv = rr.sw_iv; break; }
+                uint8_t base_gt1 = (uint8_t)sw_iv; /* 1-based GT2 instrument */
+                uint8_t clone_gt1 = (uint8_t)(clone_idx + 1);
+
+                /* Does the pattern have rows using base instrument NOT in rows_need? */
+                bool needs_clone_ptn = false;
+                {
+                    sng_pattern& ptn = gt.patterns[gt_ptn];
+                    if (ptn.data) {
+                        for (int r = 0; r < ptn.rows && !needs_clone_ptn; r++) {
+                            if (ptn.data[r].instrument != base_gt1) continue;
+                            bool in_remap = false;
+                            for (int rn : rows_need) if (rn == r) { in_remap = true; break; }
+                            if (!in_remap) needs_clone_ptn = true;
+                        }
+                    }
+                }
+
+                int target_ptn = gt_ptn;
+                if (needs_clone_ptn) {
+                    auto pc_key = std::make_pair(gt_ptn, clone_idx);
+                    auto pc_it  = ptn_clone_cache.find(pc_key);
+                    if (pc_it != ptn_clone_cache.end()) {
+                        target_ptn = pc_it->second;
+                    } else {
+                        sng_pattern ptn_copy = gt.patterns[gt_ptn];
+                        /* Deep-copy data array to avoid double-free in FreeGT2File */
+                        if (ptn_copy.rows && ptn_copy.data) {
+                            ptn_copy.data = new sng_pattern_row[ptn_copy.rows];
+                            memcpy(ptn_copy.data, gt.patterns[gt_ptn].data,
+                                   ptn_copy.rows * sizeof(sng_pattern_row));
+                        }
+                        target_ptn = (int)gt.patterns.size();
+                        gt.patterns.push_back(ptn_copy);
+                        ptn_clone_cache[pc_key] = target_ptn;
+                        printf("  Cloned GT2 pattern %d -> %d (filter clone inst %d)\n",
+                               gt_ptn + 1, target_ptn + 1, clone_idx + 1);
+                    }
+                }
+
+                if (target_ptn < 0 || target_ptn >= (int)gt.patterns.size()) continue;
+                sng_pattern& ptn = gt.patterns[target_ptn];
+                if (!ptn.data || !ptn.rows) continue;
+
+                /* Remap the specific rows */
+                for (int rn : rows_need) {
+                    if (rn < ptn.rows && ptn.data[rn].instrument == base_gt1)
+                        ptn.data[rn].instrument = clone_gt1;
+                }
+
+                /* Point relevant orderlist entries to the cloned pattern */
+                if (needs_clone_ptn && target_ptn != gt_ptn && target_ptn <= 0xFF) {
+                    for (int si2 = 0; si2 < subtunes; si2++)
+                        for (int v = 0; v < 3; v++) {
+                            sng_orderlist& ol = gt.orderlists[si2].voice[v];
+                            for (int e = 0; e < ol.length; e++)
+                                if (ol.data[e] == (uint8_t)gt_ptn)
+                                    ol.data[e] = (uint8_t)target_ptn;
+                        }
+                }
+            }
+        }
+    }
 }
 
 /*************************************************************
