@@ -751,7 +751,7 @@ static uint8_t GetOrCreateArpWtPos(
 
     /* Use all chord entries — zeros are root-note steps, not padding */
     int n_steps = (int)chord.size();
-    if (n_steps < 1) n_steps = 1;
+    if (n_steps < 1) return 0; /* empty chord — nothing to emit */
 
     int needed = n_steps + 1; /* steps + jump */
     if (wt.length + needed > 255) {
@@ -1366,19 +1366,21 @@ static void ReconstructTables(
                 if (chord_idx < (uint8_t)chords_ptr->size()) {
                     const auto& chord = (*chords_ptr)[chord_idx];
                     int n_steps = (int)chord.size();
-                    if (n_steps < 1) n_steps = 1;
-                    
-                    auto to_gt2_arp = [](uint8_t sw_off) -> uint8_t {
-                        /* Chord offsets (0x00..0x5F) are direct GT2 arp values */
-                        return sw_off;
-                    };
-                    for (int s = 0; s < n_steps; s++) {
-                        /* Set waveform on every step to keep gate open */
-                        wv_left.push_back(L);
-                        wv_right.push_back(to_gt2_arp(chord[s]));
+                    if (n_steps < 1) {
+                        /* Empty chord — skip silently (no arp entries) */
+                    } else {
+                        auto to_gt2_arp = [](uint8_t sw_off) -> uint8_t {
+                            /* Chord offsets (0x00..0x5F) are direct GT2 arp values */
+                            return sw_off;
+                        };
+                        for (int s = 0; s < n_steps; s++) {
+                            /* Set waveform on every step to keep gate open */
+                            wv_left.push_back(L);
+                            wv_right.push_back(to_gt2_arp(chord[s]));
+                        }
+                        wv_has_data = true;
                     }
-                    wv_has_data = true;
-                }
+                } /* end if chord_idx < chords_ptr->size() */
                 /* The chord must loop continuously: emit a jump back to the start
                  * of this instrument's wave table entries, then stop processing.
                  * Do NOT fall through to the next entry (which would be the 0xFF
@@ -1387,7 +1389,7 @@ static void ReconstructTables(
                 wv_right.push_back(wv_start);
                 wv_terminated = true;
                 break;
-            }
+            } /* end if R == 0x7F */
 
             /* Normal arp conversion */
             if (R >= SW1_ARP_REL_MIN)
