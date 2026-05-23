@@ -19,4 +19,4 @@ This program was coded using Claude Sonnet 4.6
 Authored by James Stone/RS-232.
 Thanks to Hermit for invaluable input on the development and testing.
 
-This software released with no restrictions.
+This software released under the "unlicense".
