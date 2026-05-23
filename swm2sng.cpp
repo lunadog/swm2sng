@@ -387,7 +387,11 @@ void LoadSWM(const char* path, SWMFile& swm) {
         if (rows <= 0 || peek_len != (uint8_t)rows) return -1;
         long consumed = (long)(pos - start);
         long delta    = (long)peek_size - consumed;
-        if (delta < 0 || delta > 64) return -1;
+        /* Delta = SIZE - packed_bytes = uncompressed_savings.
+         * No hard upper limit — the backtracker verifies the full block parses
+         * cleanly, so false positives are rejected without a delta cap.
+         * Only reject negative delta (SIZE < packed, impossible). */
+        if (delta < 0) return -1;
         return (int)rows;
     };
 
@@ -795,6 +799,9 @@ static uint8_t GetOrCreateArpWtPos(
  * chords / arp_cache / gt_file: used to materialise chord-table
  * arpeggios as wave table sequences (no instrument cloning).
  *************************************************************/
+/* Forward declaration — defined after ConvertPattern */
+static std::pair<uint8_t,uint8_t> SWvibToGTvib(uint8_t SWvibr, uint8_t Dpitch);
+
 static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
                            SpeedTableBuilder& spdBuilder,
                            uint8_t tempo_cmd   = 0,
@@ -941,36 +948,85 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
         bool    hasFX    = (instr & 0x80) != 0;
         uint8_t instrVal = instr & 0x7F;
 
-        /* Legato: instrument byte == SW1_LEGATO (bit7 clear, value 0x00)
-         * means "slide to this note without retriggering the envelope". */
-        if (!hasFX && instrVal == SW1_LEGATO) {
-            r.command   = GT2_COMMAND_TONEPORT;
-            r.parameter = 0;  /* legato = toneport with speed 0 */
-        } else if (instrVal >= SW1_SMALLFX_SETCHORD && instrVal <= (SW1_SMALLFX_SETCHORD | 0x0F)) {
-            /* $70..$7F in the instrument column = Set Chord (override default).
-             * SW chord numbers in pattern data are 1-based: 0x71 = chord 1,
-             * 0x72 = chord 2, etc.  Convert to 0-based index. */
-            uint8_t chord_num_1based = instrVal & 0x0F;
-            if (chord_num_1based > 0) {
-                uint8_t chord_num = chord_num_1based - 1;
-                if (chords && arp_cache && gt_file &&
-                    chord_num < (uint8_t)chords->size()) {
-                    uint8_t wt_pos = GetOrCreateArpWtPos(
-                                         (int)chord_num,
-                                         (*chords)[chord_num],
-                                         instrWaveform(cur_instr),
-                                         gt_file->wavetable,
-                                         *arp_cache);
-                    if (wt_pos != 0) {
-                        r.command   = GT2_COMMAND_WAVETBL;
-                        r.parameter = wt_pos;
-                    }
-                }
+        /* Helpers: instrument default values for nibble-only FX. */
+        auto instAD = [&](uint8_t iv) -> uint8_t {
+            if (!sw_instruments || iv < 1 || iv > sw_instruments->size()) return 0x00;
+            return (*sw_instruments)[iv-1].params.ad;
+        };
+        auto instSR = [&](uint8_t iv) -> uint8_t {
+            if (!sw_instruments || iv < 1 || iv > sw_instruments->size()) return 0x00;
+            return (*sw_instruments)[iv-1].params.sr;
+        };
+        auto instVib = [&](uint8_t iv) -> uint8_t {
+            if (!sw_instruments || iv < 1 || iv > sw_instruments->size()) return 0x00;
+            return (*sw_instruments)[iv-1].params.vibrato;
+        };
+        /* Filter channel-mask for instrument: reads T-byte of first filter entry. */
+        auto instFilterMask = [&](uint8_t iv) -> uint8_t {
+            if (!sw_instruments || iv < 1 || iv > sw_instruments->size()) return 0x07;
+            const SW_Instrument& si2 = (*sw_instruments)[iv-1];
+            uint8_t foff = (si2.params.filtertb_index >= SW1_INSTRUMENT_PARAMSIZE)
+                           ? si2.params.filtertb_index - SW1_INSTRUMENT_PARAMSIZE
+                           : (uint8_t)si2.tables.size();
+            if (foff + 2 < (uint8_t)si2.tables.size()) {
+                uint8_t T = si2.tables[foff + 2];
+                if (T & 0x80) return T & 0x07;
             }
+            return 0x07;
+        };
+        /* Emit waveform-register: SW nybble -> SID high nibble | gate */
+        auto emitWavereg = [&](uint8_t nybble) {
+            r.command   = GT2_COMMAND_WAVEREG;
+            r.parameter = (uint8_t)((nybble << 4) | 0x01);
+        };
+        /* Emit vibrato from combined SW vibr byte (high=amp nybble, low=freq nybble). */
+        auto emitVibFromSW = [&](uint8_t sw_vibr) {
+            if (sw_vibr == 0) { r.command = GT2_COMMAND_NOP; return; }
+            auto [GTfreq, GTamp] = SWvibToGTvib(sw_vibr, Dpitch);
+            uint8_t tidx = spdBuilder.add(GTfreq, GTamp);
+            r.command   = GT2_COMMAND_VIBRATO;
+            r.parameter = tidx ? tidx : 1;
+        };
+        /* Emit set-chord via wave table (1-based chord number). */
+        auto emitChord = [&](uint8_t chord_1based) {
+            if (!chord_1based) return;
+            uint8_t ci = chord_1based - 1;
+            if (!chords || !arp_cache || !gt_file) return;
+            if (ci >= (uint8_t)chords->size()) return;
+            uint8_t wt_pos = GetOrCreateArpWtPos((int)ci, (*chords)[ci],
+                                                  instrWaveform(cur_instr),
+                                                  gt_file->wavetable, *arp_cache);
+            if (wt_pos) { r.command = GT2_COMMAND_WAVETBL; r.parameter = wt_pos; }
+        };
+
+        /* ---- Instrument column effects ---- */
+        if (instrVal == SW1_LEGATO) {
+            /* $3F  Legato: set pitch without retriggering envelope -> instant toneport */
+            r.command   = GT2_COMMAND_TONEPORT;
+            r.parameter = 0;
+        } else if (instrVal >= SW1_SMALLFX_WAVEFORM &&
+                   instrVal <  SW1_SMALLFX_SUSTAIN) {
+            /* $40..$4F  Set Waveform */
+            emitWavereg(instrVal & 0x0F);
+        } else if (instrVal >= SW1_SMALLFX_SUSTAIN &&
+                   instrVal <  SW1_SMALLFX_RELEASE) {
+            /* $50..$5F  Set Sustain */
+            r.command   = GT2_COMMAND_SR;
+            r.parameter = (uint8_t)(((instrVal & 0x0F) << 4) | (instSR(cur_instr) & 0x0F));
+        } else if (instrVal >= SW1_SMALLFX_RELEASE &&
+                   instrVal <  SW1_SMALLFX_SETCHORD) {
+            /* $60..$6F  Set Release */
+            r.command   = GT2_COMMAND_SR;
+            r.parameter = (uint8_t)((instSR(cur_instr) & 0xF0) | (instrVal & 0x0F));
+        } else if (instrVal >= SW1_SMALLFX_SETCHORD &&
+                   instrVal <= (SW1_SMALLFX_SETCHORD | 0x0F)) {
+            /* $70..$7F  Set Chord (1-based) */
+            emitChord(instrVal & 0x0F);
         } else if (instrVal >= SW1_INSTRUMENT_MIN &&
                    instrVal <= SW1_INSTRUMENT_MAX) {
+            /* $01..$3E  Select instrument */
             r.instrument = instrVal;
-            cur_instr    = instrVal;  /* update active instrument for shift lookup */
+            cur_instr    = instrVal;
         }
 
         if (!hasFX) { row++; continue; }
@@ -985,32 +1041,64 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
             row++; continue;
         }
 
-        /* Small FX (no parameter byte) */
+        /* ---- Small FX (no parameter byte, all info in the fx byte itself) ---- */
         if (fx >= SW1_SMALLFX_MIN) {
             uint8_t fxbase  = fx & 0xF0;
             uint8_t fxnybbl = fx & 0x0F;
-            if (fxbase == SW1_SMALLFX_MAINVOL) {
-                r.command   = GT2_COMMAND_VOLUME;
-                r.parameter = fxnybbl;
-            } else if (fxbase == SW1_SMALLFX_SETCHORD) {
-                /* 0x70..0x7F in the FX column = Set Chord.
-                 * SW chord numbers are 1-based: 0x71=chord1, 0x72=chord2, etc. */
-                if (fxnybbl > 0) {
-                    uint8_t chord_num = fxnybbl - 1;
-                    if (chords && arp_cache && gt_file &&
-                        chord_num < (uint8_t)chords->size()) {
-                        uint8_t wt_pos = GetOrCreateArpWtPos(
-                                             (int)chord_num,
-                                             (*chords)[chord_num],
-                                             instrWaveform(cur_instr),
-                                             gt_file->wavetable,
-                                             *arp_cache);
-                        if (wt_pos != 0) {
-                            r.command   = GT2_COMMAND_WAVETBL;
-                            r.parameter = wt_pos;
-                        }
-                    }
+            switch (fxbase) {
+                case SW1_SMALLFX_ATTACK:   /* $20..$2F  Attack nybble */
+                    r.command   = GT2_COMMAND_AD;
+                    r.parameter = (uint8_t)((fxnybbl << 4) | (instAD(cur_instr) & 0x0F));
+                    break;
+                case SW1_SMALLFX_DECAY:    /* $30..$3F  Decay nybble */
+                    r.command   = GT2_COMMAND_AD;
+                    r.parameter = (uint8_t)((instAD(cur_instr) & 0xF0) | fxnybbl);
+                    break;
+                case SW1_SMALLFX_WAVEFORM: /* $40..$4F  Waveform nybble */
+                    emitWavereg(fxnybbl);
+                    break;
+                case SW1_SMALLFX_SUSTAIN:  /* $50..$5F  Sustain nybble */
+                    r.command   = GT2_COMMAND_SR;
+                    r.parameter = (uint8_t)((fxnybbl << 4) | (instSR(cur_instr) & 0x0F));
+                    break;
+                case SW1_SMALLFX_RELEASE:  /* $60..$6F  Release nybble */
+                    r.command   = GT2_COMMAND_SR;
+                    r.parameter = (uint8_t)((instSR(cur_instr) & 0xF0) | fxnybbl);
+                    break;
+                case SW1_SMALLFX_SETCHORD: /* $70..$7F  Set Chord (1-based) */
+                    emitChord(fxnybbl);
+                    break;
+                case SW1_SMALLFX_VIBAMP: { /* $80..$8F  Vibrato amplitude nybble */
+                    uint8_t sw_vibr = (uint8_t)((fxnybbl << 4) |
+                                                 (instVib(cur_instr) & 0x0F));
+                    emitVibFromSW(sw_vibr);
+                    break;
                 }
+                case SW1_SMALLFX_VIBFREQ: { /* $90..$9F  Vibrato rate nybble */
+                    uint8_t sw_vibr = (uint8_t)((instVib(cur_instr) & 0xF0) | fxnybbl);
+                    emitVibFromSW(sw_vibr);
+                    break;
+                }
+                case SW1_SMALLFX_MAINVOL:  /* $A0..$AF  Main volume */
+                    r.command   = GT2_COMMAND_VOLUME;
+                    r.parameter = fxnybbl;
+                    break;
+                case SW1_SMALLFX_FILTBAND: /* $B0..$BF  Filter cutoff hi-byte nybble
+                                            * GT2 $Cxy: x=nybble, y=0 */
+                    r.command   = GT2_COMMAND_FILTERCUT;
+                    r.parameter = (uint8_t)(fxnybbl << 4);
+                    break;
+                case SW1_SMALLFX_CHORDSPD: /* $C0..$CF  Chord speed — no GT2 equiv */
+                case SW1_SMALLFX_DETUNE:   /* $D0..$DF  Detune      — no GT2 equiv */
+                case SW1_SMALLFX_WAVEREGC: /* $E0..$EF  Wave ctrl   — no GT2 equiv */
+                    break; /* silently dropped */
+                case SW1_SMALLFX_RESONANCE:/* $F0..$FF  Filter resonance nybble
+                                            * GT2 $Bxy: x=reso nybble, y=inst channel mask */
+                    r.command   = GT2_COMMAND_FILTERCTRL;
+                    r.parameter = (uint8_t)((fxnybbl << 4) | instFilterMask(cur_instr));
+                    break;
+                default:
+                    break;
             }
             row++; continue;
         }
@@ -1025,12 +1113,14 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
              * and emit GT2_COMMAND_WAVETBL to redirect the wave table pointer
              * there.  The instrument is unchanged — no cloning needed. */
             case SW1_BIGFX_SETCHORD: {
+                /* fxval is 1-based: fxval=1 means chord 0, fxval=7 means chord 6. */
                 if (chords && arp_cache && gt_file &&
-                    fxval < (uint8_t)chords->size())
+                    fxval > 0 && (fxval - 1) < (uint8_t)chords->size())
                 {
+                    uint8_t chord_idx = fxval - 1;
                     uint8_t wt_pos = GetOrCreateArpWtPos(
-                                         (int)fxval,
-                                         (*chords)[fxval],
+                                         (int)chord_idx,
+                                         (*chords)[chord_idx],
                                          instrWaveform(cur_instr),
                                          gt_file->wavetable,
                                          *arp_cache);
@@ -1093,8 +1183,9 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
                 r.command = GT2_COMMAND_TEMPO;    r.parameter = fxval; break;
             case SW1_BIGFX_TRACKTEMPO:
                 r.command = GT2_COMMAND_TEMPO;    r.parameter = fxval | 0x80; break;
-            case SW1_BIGFX_FUNKTEMPO: {
-                /* fxval encodes two nibble speeds: high=speed1, low=speed2 */
+            case SW1_BIGFX_FUNKTEMPO:
+            case SW1_BIGFX_TRACKFUNKT: {
+                /* Both global and per-track funk tempo: GT2 $Exy -> speedtable entry */
                 uint8_t s1 = (fxval >> 4) & 0x0F;
                 uint8_t s2 =  fxval       & 0x0F;
                 uint8_t tidx = spdBuilder.add(s1, s2);
@@ -1102,8 +1193,18 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
                 r.parameter = tidx ? tidx : 1;
                 break;
             }
-            default:
-                r.command = GT2_COMMAND_NOP; r.parameter = 0; break;
+
+            /* No GT2 equivalent — silently dropped */
+            case SW1_BIGFX_CHORDSPEED:  /* $0C chord speed */
+            case SW1_BIGFX_DETUNE:      /* $0D detune up */
+            case SW1_BIGFX_PULSEWIDTH:  /* $0E set pulse width */
+            case SW1_BIGFX_TEMPOPROG:   /* $12 tempo program */
+            case SW1_BIGFX_TRKTEMPOPRG: /* $15 track tempo program */
+            case SW1_BIGFX_VIBRATYPE:   /* $16 vibrato type */
+            case SW1_BIGFX_FILTERSHIFT: /* $1C filter cutoff shift */
+            case SW1_BIGFX_DELAYTRACK:  /* $1D delay track */
+            case SW1_BIGFX_DELAYNOTE:   /* $1E delay note */
+                break;
         }
         row++;
     }
