@@ -14,4 +14,9 @@ Usage: swm2sng [--no-filter-clone] <input.swm> [output.sng]Usage: swm2sng [--no-
 
 Due to the differences in the way these programs use filters and chords, there are likely to be a number of bugs - please test and report any unexpected effects.
 
-This program was vibe coded using Claude Sonnet 4.6
+This program was coded using Claude Sonnet 4.6
+
+Authored by James Stone/RS-232.
+Thanks to Hermit for invaluable input on the development and testing.
+
+This software released with no restrictions.
