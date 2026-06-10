@@ -655,8 +655,120 @@ struct SpeedTableBuilder {
 };
 
 /*************************************************************
+ * Hermit's vibrato / slide lookup tables (from SWMconvert.c 2026)
+ * These replace the original sng2swm-derived approach and produce
+ * better-sounding output, especially for vibrato rates and speeds.
+ *************************************************************/
+
+/* Maps SW vibrato period nibble (0..15) -> GT2 speedtable left value.
+ * OR'd with SNG_CALC_BIT (0x80) to enable calculated vibrato mode. */
+static const uint8_t GTvibRates[16] = {
+    0x7F, 0x00, 0x01, 0x01, 0x02, 0x02, 0x03, 0x04,
+    0x05, 0x06, 0x07, 0x08, 0x0A, 0x0C, 0x10, 0x14
+};
+
+/* Maps SW vibrato amplitude nibble (0..15) -> GT2 calculated-vibrato divisor. */
+static const uint8_t SNGcalcVibratoAmpDiv[16] = {
+    7, 6, 6, 5, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 1, 0
+};
+
+/* Maps (slidein >> 3) to GT2 calculated-slide divisor (input < 0x60). */
+static const uint8_t SNGcalcSlideDiv[32] = {
+    5, 4, 4, 4, 4, 3, 3, 3, 2, 2, 2, 1, 1, 1, 1, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+};
+
+/* Same for portamento. */
+static const uint8_t SNGcalcPortDiv[32] = {
+    4, 3, 3, 3, 3, 2, 2, 1, 1, 1, 1, 1, 1, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+};
+
+/* Non-calculated slide/portamento 16-bit speeds for (slidein >> 3) index 0..31. */
+static const int SNGslideSpeeds[32] = {
+    0x0000, 0x0004, 0x0008, 0x000C, 0x0010, 0x0014, 0x0018, 0x0020,
+    0x0030, 0x0050, 0x0070, 0x00B0, 0x00F0, 0x0130, 0x0170, 0x01C0,
+    0x0200, 0x0240, 0x0280, 0x02C0, 0x0300, 0x0340, 0x0380, 0x03C0,
+    0x0400, 0x0440, 0x0480, 0x04C0, 0x0500, 0x0540, 0x0580, 0x05C0
+};
+static const int SNGportSpeeds[32] = {
+    0x0000, 0x0008, 0x0010, 0x0018, 0x0020, 0x0028, 0x0034, 0x0040,
+    0x0050, 0x0068, 0x0088, 0x00C0, 0x0100, 0x0180, 0x0200, 0x0280,
+    0x0300, 0x0380, 0x0400, 0x0480, 0x0500, 0x0580, 0x0600, 0x0700,
+    0x0800, 0x0900, 0x0A00, 0x0C00, 0x0E00, 0x1000, 0x1200, 0x1400
+};
+
+/* Below this threshold: use GT2 calculated slide (left |= 0x80). */
+static const uint8_t SWM_SLIDE_CALC_THRESHOLD = 0x60;
+/* GT2 calculated-slide/vibrato flag in speedtable left byte. */
+static const uint8_t SNG_CALC_BIT = 0x80;
+/* Exponential-table base offset for high-range slides.
+ * = SWM_FREQTBH_POS/2 (6 in Hermit's 1-offset GTexpTabH) - 1 (to convert to
+ * 0-based SWexpTabH index) = 5. */
+static const int SWM_EXPLOOKUP_BASE = 5;
+
+/*************************************************************
  * SWsldToGTsld
- * Exact inverse of GTsldToSWsld() from sng2swm.cpp.
+ * Converts a SID-Wizard slide byte + current note to a GT2
+ * speedtable (hi, lo) pair, using Hermit's two-path approach:
+ *  - input < 0x60: GT2 calculated slide (left bit7 set), divisor
+ *    from SNGcalcSlideDiv.
+ *  - input >= 0x60: direct exponential-table lookup (non-calculated),
+ *    note-compensated, using SWexpTabH (= Hermit's GTexpTabH - 1 offset).
+ * is_portamento selects slightly different divisor/speed tables.
+ * Dpitch = current note value (SW 1-based, 1..0x5F).
+ *************************************************************/
+static std::pair<uint8_t,uint8_t> SWsldToGTsld(uint8_t SWsld, uint8_t Dpitch,
+                                                bool is_portamento = false) {
+    if (SWsld == 0) return {0x00, 0x00};
+
+    if (SWsld < SWM_SLIDE_CALC_THRESHOLD) {
+        /* Calculated mode: GT2 plays back the slide as a real-time delta. */
+        int idx = (int)(SWsld >> 3);
+        if (idx >= 32) idx = 31;
+        uint8_t divisor = is_portamento ? SNGcalcPortDiv[idx]
+                                        : SNGcalcSlideDiv[idx];
+        return { (uint8_t)(SNG_CALC_BIT), divisor };
+    } else {
+        /* High-range: use exponential table, note-compensated.
+         * Formula (Hermit): GTexpTabH[6 + slidein/2 + (note-1)]
+         *   = SWexpTabH[5 + slidein/2 + (note-1)]  (0-based SWexpTabH) */
+        int table_idx = SWM_EXPLOOKUP_BASE + (int)(SWsld >> 1)
+                        + (int)(Dpitch) - 1;  /* note is 1-based, so -1 */
+
+        if (table_idx < EXPTRESHOLD) {
+            int clamped = std::max(0, std::min(table_idx, EXPTRESHOLD - 1));
+            uint8_t delta = SWexpTabH[clamped];
+            int pitchmod = (int)delta;
+            int max_val = is_portamento ? 0x7FFF : 0xFFFF; /* avoid portamento overload */
+            if (pitchmod > max_val) pitchmod = max_val;
+            return { 0x00, (uint8_t)pitchmod };
+        } else {
+            int j = table_idx - EXPTRESHOLD;
+            if (j >= FREQTB_SIZE) j = FREQTB_SIZE - 1;
+            int pitchmod = ((int)SWexpTabH[j + FREQTBH_POS] << 8)
+                         | (int)SWexpTabL[j];
+            int max_val = is_portamento ? 0x7FFF : 0xFFFF;
+            if (pitchmod > max_val) pitchmod = max_val;
+            return { (uint8_t)(pitchmod >> 8), (uint8_t)(pitchmod & 0xFF) };
+        }
+    }
+}
+
+/*************************************************************
+ * SWsldToGTspd
+ * Wrapper: converts SW slide byte + note to a GT2 speedtable
+ * index.  Uses SWsldToGTsld for the actual frequency lookup.
+ *
+ * Dpitch should be the most recent discrete note played on the
+ * voice so that the slide speed is note-pitch compensated.
+ *************************************************************/
+static uint8_t SWsldToGTspd(uint8_t SWsld, uint8_t Dpitch,
+                              SpeedTableBuilder& spdtbl,
+                              bool is_portamento = false) {
+    auto [hi, lo] = SWsldToGTsld(SWsld, Dpitch, is_portamento);
+    return spdtbl.add(hi, lo);
+}
  *
  * GTsldToSWsld(GTpos, Dpitch, spdtbl) converts a GT2 speed-
  * table entry (16-bit pitch delta) into a SID-Wizard slide
@@ -680,43 +792,6 @@ struct SpeedTableBuilder {
  *
  * Returns a {high, low} pair suitable for a GT2 speedtable entry.
  *************************************************************/
-static std::pair<uint8_t,uint8_t> SWsldToGTsld(uint8_t SWsld, uint8_t Dpitch) {
-    /* Clamp to valid signed range */
-    int i = (int)(SWsld >> 1) + (int)Dpitch;
-
-    if (i < EXPTRESHOLD) {
-        /* Small-delta range: single-byte pitch delta */
-        int idx = std::max(0, std::min(i, EXPTRESHOLD - 1));
-        uint8_t delta = SWexpTabH[idx];
-        return { 0x00, delta };
-    } else {
-        /* Large-delta range: 16-bit pitch delta */
-        int j = i - EXPTRESHOLD;
-        if (j >= FREQTB_SIZE) j = FREQTB_SIZE - 1;
-        uint8_t hi = SWexpTabH[j + FREQTBH_POS];
-        uint8_t lo = SWexpTabL[j];
-        return { hi, lo };
-    }
-}
-
-/*************************************************************
- * SWsldToGTspd
- * Converts a SID-Wizard slide speed byte to a GT2 speedtable
- * index.  Uses SWsldToGTsld for the actual frequency lookup.
- *
- * Dpitch should be the most recent discrete note played on the
- * channel (SW1_NOTE_MAX/2 as default if unknown).
- *************************************************************/
-static uint8_t SWsldToGTspd(uint8_t SWsld, uint8_t Dpitch,
-                             SpeedTableBuilder& spdBuilder) {
-    if (SWsld == 0) return 0;  /* speed 0 = legato / instant */
-    auto [hi, lo] = SWsldToGTsld(SWsld, Dpitch);
-    /* Avoid all-zero entry which GT2 treats as "no effect" */
-    if (hi == 0 && lo == 0) lo = 1;
-    uint8_t idx = spdBuilder.add(hi, lo);
-    return idx ? idx : 1;
-}
-
 /*************************************************************
  * GetOrCreateArpWtPos
  * Returns (or creates) a GT2 wave table position for the given
@@ -1132,16 +1207,16 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
                 break;
             }
 
-            /* Slide effects: SW speed byte -> GT2 speedtable index via the
-             * exact inverse of GTsldToSWsld (uses SWexpTabH/L from swm.h). */
+            /* Slide effects: Hermit's two-path approach (calculated below 0x60,
+             * exponential-table lookup at/above 0x60, note-pitch compensated). */
             case SW1_BIGFX_PORTUP:
                 r.command   = GT2_COMMAND_PORTUP;
-                r.parameter = SWsldToGTspd(fxval, Dpitch, spdBuilder);
+                r.parameter = SWsldToGTspd(fxval, Dpitch, spdBuilder, false);
                 port_cmd = r.command; port_param = r.parameter;
                 break;
             case SW1_BIGFX_PORTDOWN:
                 r.command   = GT2_COMMAND_PORTDOWN;
-                r.parameter = SWsldToGTspd(fxval, Dpitch, spdBuilder);
+                r.parameter = SWsldToGTspd(fxval, Dpitch, spdBuilder, false);
                 port_cmd = r.command; port_param = r.parameter;
                 break;
             case SW1_BIGFX_TONEPORT:
@@ -1151,13 +1226,13 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
                     port_cmd = port_param = 0;  /* legato is not a repeating slide */
                 } else {
                     r.command   = GT2_COMMAND_TONEPORT;
-                    r.parameter = SWsldToGTspd(fxval, Dpitch, spdBuilder);
+                    r.parameter = SWsldToGTspd(fxval, Dpitch, spdBuilder, true);
                     port_cmd = r.command; port_param = r.parameter;
                 }
                 break;
             case SW1_BIGFX_VIBRATO:
                 r.command   = GT2_COMMAND_VIBRATO;
-                r.parameter = SWsldToGTspd(fxval, Dpitch, spdBuilder);
+                r.parameter = SWsldToGTspd(fxval, Dpitch, spdBuilder, false);
                 break;
 
             /* Direct-value effects */
@@ -1606,54 +1681,21 @@ static void ReconstructTables(
 
 /*************************************************************
  * SWvibToGTvib
- * Exact inverse of GTvibToSWvib() from sng2swm.
- *
- * GTvibToSWvib encodes vibrato as:
- *   SWamp = (i - Dpitch) * 4       (i found via SWexpTabH[i] <= GTamp)
- *   SWvibr = (SWamp & 0xF0) + SWvibFreq[GTfreq]
- *
- * So the stored byte packs:
- *   HIGH nibble = SWamp >> 4       (amplitude class)
- *   LOW  nibble = SWvibFreq[GTfreq] (frequency index)
- *
- * Inverse:
- *   amp_nibble  = (SWvibr >> 4) & 0xF
- *   freq_nibble = SWvibr & 0xF
- *   SWamp       = amp_nibble * 16
- *   i           = SWamp / 4 + Dpitch = amp_nibble * 4 + Dpitch
- *   GTamp       = SWexpTabH[ clamp(i, 0, EXPTRESHOLD-1) ]
- *
- * For the frequency: SWvibFreq[] maps GT2 freq (0..15) → SW nibble.
- * We don't have that table, so we use freq_nibble directly as GTfreq.
- * This is exact when SWvibFreq is the identity permutation; otherwise
- * the speed is approximate but the depth is accurate.
- *
- * vibtype (from params.flag.vibtype):
- *   0 = triangle vibrato (standard, use Dpitch for amplitude lookup)
- *   1 = sine vibrato     (sng2swm always writes 1; same formula applies)
- *   When vibtype indicates "calculated" (GT2 bit7 on GTamp), the
- *   amplitude lookup skips Dpitch.  We handle this by checking if
- *   amp_nibble is 0 — in that case the depth is negligible.
- *
- * Returns a pair {GTfreq_byte, GTamp_byte} for a speedtable entry.
+ * Converts the SID-Wizard vibrato byte to a GT2 speedtable entry.
+ * Uses Hermit's approach from SWMconvert.c (2026):
+ *   - left  = GTvibRates[SW_period_nibble] | 0x80  (calculated mode)
+ *   - right = SNGcalcVibratoAmpDiv[SW_amplitude_nibble]
+ * Dpitch is retained in the signature for compatibility but not
+ * used — calculated vibrato does not need note compensation.
+ * Returns {left, right} for the GT2 speedtable entry.
  *************************************************************/
-static std::pair<uint8_t,uint8_t> SWvibToGTvib(uint8_t SWvibr, uint8_t Dpitch) {
+static std::pair<uint8_t,uint8_t> SWvibToGTvib(uint8_t SWvibr, uint8_t /*Dpitch*/) {
     if (SWvibr == 0) return {0, 0};
-
     uint8_t amp_nibble  = (SWvibr >> 4) & 0x0F;
-    uint8_t freq_nibble = SWvibr & 0x0F;
-
-    /* Recover GTamp via the same SWexpTabH table used in sng2swm */
-    int i = (int)amp_nibble * 4 + (int)Dpitch;
-    if (i >= EXPTRESHOLD) i = EXPTRESHOLD - 1;
-    if (i < 0)            i = 0;
-    uint8_t GTamp = SWexpTabH[i];
-    if (GTamp == 0 && amp_nibble > 0) GTamp = 1; /* ensure at least 1 */
-
-    /* Clamp GTfreq: GT2 speedtable left byte for vibrato is 0..15 */
-    uint8_t GTfreq = freq_nibble & 0x0F;
-
-    return {GTfreq, GTamp};
+    uint8_t freq_nibble =  SWvibr       & 0x0F;
+    uint8_t left  = (uint8_t)(GTvibRates[freq_nibble] | SNG_CALC_BIT);
+    uint8_t right = SNGcalcVibratoAmpDiv[amp_nibble];
+    return {left, right};
 }
 
 /*************************************************************
