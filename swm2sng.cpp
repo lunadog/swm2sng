@@ -769,29 +769,7 @@ static uint8_t SWsldToGTspd(uint8_t SWsld, uint8_t Dpitch,
     auto [hi, lo] = SWsldToGTsld(SWsld, Dpitch, is_portamento);
     return spdtbl.add(hi, lo);
 }
- *
- * GTsldToSWsld(GTpos, Dpitch, spdtbl) converts a GT2 speed-
- * table entry (16-bit pitch delta) into a SID-Wizard slide
- * speed byte using the SID frequency tables from swm.h:
- *
- *   GTslide = spdtbl->left[GTpos-1]*256 + spdtbl->right[GTpos-1]
- *   if (GTslide < 0x100):
- *     find i s.t. SWexpTabH[i] <= GTslide  (i from EXPTRESHOLD-1 down)
- *     SWsld = (i - Dpitch) * 2
- *   else:
- *     find i s.t. SWexpTabH[i+FREQTBH_POS]*256+SWexpTabL[i] <= GTslide
- *     SWsld = ((i+EXPTRESHOLD) - Dpitch) * 2
- *
- * Inverse: given SWsld and Dpitch, recover GTslide:
- *   SWsld < 2*EXPTRESHOLD  (index i is in the small-delta range):
- *     i = SWsld/2 + Dpitch
- *     GTslide = SWexpTabH[i]              (single-byte delta)
- *   else:
- *     i = SWsld/2 + Dpitch - EXPTRESHOLD  (index into large table)
- *     GTslide = SWexpTabH[i+FREQTBH_POS]*256 + SWexpTabL[i]
- *
- * Returns a {high, low} pair suitable for a GT2 speedtable entry.
- *************************************************************/
+
 /*************************************************************
  * GetOrCreateArpWtPos
  * Returns (or creates) a GT2 wave table position for the given
@@ -819,11 +797,14 @@ static uint8_t SWsldToGTspd(uint8_t SWsld, uint8_t Dpitch,
 static uint8_t GetOrCreateArpWtPos(
         int                               chord_num,
         const std::vector<uint8_t>&       chord,
-        uint8_t                           waveform,  /* waveform for first arp entry */
+        uint8_t                           waveform,   /* waveform byte for first arp step */
+        uint8_t                           arp_speed,  /* instrument arp_speed for steps 1+ */
         sng_table&                        wt,
         std::map<std::pair<int,int>,uint8_t>& arp_cache)
 {
-    auto cache_key = std::make_pair(chord_num, (int)waveform);
+    /* Cache key encodes chord, waveform, and arp_speed so different instruments
+     * with the same chord but different speeds get separate table entries. */
+    auto cache_key = std::make_pair(chord_num, (int)waveform | ((int)arp_speed << 8));
     auto it = arp_cache.find(cache_key);
     if (it != arp_cache.end())
         return it->second;
@@ -839,17 +820,16 @@ static uint8_t GetOrCreateArpWtPos(
     }
 
     auto sw_to_gt2_arp = [](uint8_t sw_offset) -> uint8_t {
-        /* SW chord table offsets are positive semitone counts (0x00..0x5F).
-         * In the GT2 wave table right column, 0x01..0x5F are also direct
-         * positive semitone offsets.  No constant offset needed. */
+        /* SW chord offsets (0x00..0x5F) are direct GT2 arp values. */
         return sw_offset;
     };
 
     uint8_t arp_start = (uint8_t)(wt.length + 1); /* 1-based */
     for (int s = 0; s < n_steps; s++) {
-        /* Set waveform on every step so the gate stays open and the note
-         * doesn't fade out between arp steps. */
-        wt.left [wt.length] = waveform;
+        /* First step: use the instrument waveform byte so the SID register is set.
+         * Subsequent steps: use arp_speed as the L byte (Hermit's algorithm) — the
+         * speed value tells the GT2 player how many frames to hold each chord note. */
+        wt.left [wt.length] = (s == 0) ? waveform : arp_speed;
         wt.right[wt.length] = sw_to_gt2_arp(chord[s]);
         wt.length++;
     }
@@ -857,8 +837,8 @@ static uint8_t GetOrCreateArpWtPos(
     wt.right[wt.length] = arp_start;
     wt.length++;
 
-    printf("  Chord %d waveform=0x%02X (%zu steps) -> wave table pos %d\n",
-           chord_num, waveform, chord.size(), arp_start);
+    printf("  Chord %d waveform=0x%02X arp_speed=%d (%zu steps) -> wave table pos %d\n",
+           chord_num, waveform, arp_speed, chord.size(), arp_start);
 
     arp_cache[cache_key] = arp_start;
     return arp_start;
@@ -874,8 +854,14 @@ static uint8_t GetOrCreateArpWtPos(
  * chords / arp_cache / gt_file: used to materialise chord-table
  * arpeggios as wave table sequences (no instrument cloning).
  *************************************************************/
-/* Forward declaration — defined after ConvertPattern */
+/* Forward declarations — defined after ConvertPattern */
 static std::pair<uint8_t,uint8_t> SWvibToGTvib(uint8_t SWvibr, uint8_t Dpitch);
+static uint8_t GetOrCreateArpWtPos(int chord_num,
+                                    const std::vector<uint8_t>& chord,
+                                    uint8_t waveform,
+                                    uint8_t arp_speed,
+                                    sng_table& wt,
+                                    std::map<std::pair<int,int>,uint8_t>& arp_cache);
 
 static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
                            SpeedTableBuilder& spdBuilder,
@@ -1036,6 +1022,11 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
             if (!sw_instruments || iv < 1 || iv > sw_instruments->size()) return 0x00;
             return (*sw_instruments)[iv-1].params.vibrato;
         };
+        /* Arp/chord speed for instrument (bits 5..0 of arpchord_speed byte). */
+        auto instArpSpeed = [&](uint8_t iv) -> uint8_t {
+            if (!sw_instruments || iv < 1 || iv > sw_instruments->size()) return 1;
+            return (*sw_instruments)[iv-1].params.arpchord_speed & 0x3F;
+        };
         /* Filter channel-mask for instrument: reads T-byte of first filter entry. */
         auto instFilterMask = [&](uint8_t iv) -> uint8_t {
             if (!sw_instruments || iv < 1 || iv > sw_instruments->size()) return 0x07;
@@ -1070,6 +1061,7 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
             if (ci >= (uint8_t)chords->size()) return;
             uint8_t wt_pos = GetOrCreateArpWtPos((int)ci, (*chords)[ci],
                                                   instrWaveform(cur_instr),
+                                                  instArpSpeed(cur_instr),
                                                   gt_file->wavetable, *arp_cache);
             if (wt_pos) { r.command = GT2_COMMAND_WAVETBL; r.parameter = wt_pos; }
         };
@@ -1197,6 +1189,7 @@ static void ConvertPattern(const SW_Pattern& sw, sng_pattern& gt,
                                          (int)chord_idx,
                                          (*chords)[chord_idx],
                                          instrWaveform(cur_instr),
+                                         instArpSpeed(cur_instr),
                                          gt_file->wavetable,
                                          *arp_cache);
                     if (wt_pos != 0) {
@@ -1549,22 +1542,24 @@ static void ReconstructTables(
                             /* Chord offsets (0x00..0x5F) are direct GT2 arp values */
                             return sw_off;
                         };
+                        /* Hermit's algorithm: first step uses the waveform byte (L/command),
+                         * subsequent steps use the instrument's arp_speed value as the L byte.
+                         * This matches SID-Wizard's player behaviour where the waveform is set
+                         * only on the first step and the speed controls how long each note plays. */
+                        uint8_t arp_speed = si.params.arpchord_speed & 0x3F;
                         for (int s = 0; s < n_steps; s++) {
-                            /* Set waveform on every step to keep gate open */
-                            wv_left.push_back(L);
+                            wv_left.push_back(s == 0 ? L : arp_speed);
                             wv_right.push_back(to_gt2_arp(chord[s]));
                         }
                         wv_has_data = true;
                     }
                 } /* end if chord_idx < chords_ptr->size() */
-                /* The chord must loop continuously: emit a jump back to the start
-                 * of this instrument's wave table entries, then stop processing.
-                 * Do NOT fall through to the next entry (which would be the 0xFF
-                 * stop marker, causing the arp to play only once). */
-                wv_left.push_back(GT2_TABLE_JUMP);
-                wv_right.push_back(wv_start);
-                wv_terminated = true;
-                break;
+                /* R=0x7F chord expanded — continue to the next wave table entry.
+                 * The jump back to the loop start is written when we hit L=0xFE
+                 * (explicit TABLE_JUMP) or L=0xFF (TABLE_END), just like any other
+                 * entry.  Multiple consecutive R=0x7F entries are all expanded in
+                 * sequence before the terminating jump is added. */
+                continue;  /* for-loop t+=3 handles the advance */
             } /* end if R == 0x7F */
 
             /* Normal arp conversion */
